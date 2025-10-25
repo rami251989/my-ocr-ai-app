@@ -140,95 +140,153 @@ def _between(s: str, start_tag: str, end_tag: str) -> str:
     return (m.group(1).strip() if m else "")
 
 def parse_tagged_response(raw: str) -> dict:
-    import json, re
-    # إزالة محارف الاتجاه/BOM/Zero-width
-    raw = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u200B\u200C\u200D]", "", raw).strip()
+   def chunk_text(text: str, max_chars: int = 12000) -> list:
+    """
+    يقص النص لقطع قصيرة حتى لا يرفضه الموديل بسبب الطول.
+    يراعي الفصل على حدود أسطر إن أمكن.
+    """
+    text = text or ""
+    if len(text) <= max_chars:
+        return [text]
+    chunks, start = [], 0
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        # حاول القص عند أقرب سطر
+        nl = text.rfind("\n", start, end)
+        if nl == -1 or nl <= start + int(max_chars*0.5):
+            nl = end
+        chunks.append(text[start:nl].strip())
+        start = nl
+    return [c for c in chunks if c]
 
-    def g(a, b):
-        pat = re.compile(re.escape(a) + r"(.*?)" + re.escape(b), re.S)
-        m = pat.search(raw)
-        return (m.group(1).strip() if m else "")
 
-    items_json = g("<<<ITEMS_JSON_ARRAY>>>", "<<<END_ITEMS_JSON_ARRAY>>>").strip()
-
-    items = []
-    if items_json:
-        # إزالة code fences إن وُجدت
-        items_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", items_json, flags=re.IGNORECASE | re.MULTILINE).strip()
-        # تطبيع علامات الاقتباس والفواصل العربية
-        items_json = (items_json
-                      .replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
-                      .replace("،", ",").replace("٫", "."))
-        # إزالة الفواصل الزائدة قبل الأقواس
-        items_json = re.sub(r",\s*([}\]])", r"\1", items_json)
-        # اقتباس المفاتيح غير المقتبسة (عربية/إنجليزية/أرقام/شرطة سفلية)
-        items_json = re.sub(r'([{,]\s*)([A-Za-z0-9_ء-ي]+)\s*:', r'\1"\2":', items_json)
-        # في بعض الأحيان اسم_المادة يُعاد رقمًا → اقتبسه كسلسلة
-        items_json = re.sub(r'("اسم_المادة"\s*:\s*)(-?\d+(?:\.\d+)?)', r'\1"\2"', items_json)
-
-        try:
-            parsed = json.loads(items_json)
-        except Exception as e:
-            # محاولة ثانية بعد تنظيف بسيط
-            items_json2 = re.sub(r"\s+\n\s+", "\n", items_json)
-            try:
-                parsed = json.loads(items_json2)
-            except Exception:
-                parsed = []
-
-        # تأكد أن النتيجة قائمة من كائنات
-        if isinstance(parsed, dict):
-            items = [parsed]
-        elif isinstance(parsed, list):
-            items = [x for x in parsed if isinstance(x, dict)]
-        else:
-            items = []
-    else:
-        items = []
-
-    return {
-        "الفريق_الأول": g("<<<TEAM_A>>>", "<<<END_TEAM_A>>>"),
-        "الفريق_الثاني": g("<<<TEAM_B>>>", "<<<END_TEAM_B>>>"),
-        "تاريخ_البدء": g("<<<DATE_START>>>", "<<<END_DATE_START>>>"),
-        "تاريخ_الانتهاء": g("<<<DATE_END>>>", "<<<END_DATE_END>>>"),
-        "ملخص_الاتفاقية": g("<<<SUMMARY>>>", "<<<END_SUMMARY>>>"),
-        "المواد": items,
-        "فقرة_الكفالات": g("<<<WARRANTIES>>>", "<<<END_WARRANTIES>>>"),
-        "الشروط_الخاصة": g("<<<SPECIAL_TERMS>>>", "<<<END_SPECIAL_TERMS>>>"),
-        "الشروط_العامة": g("<<<GENERAL_TERMS>>>", "<<<END_GENERAL_TERMS>>>")
+def merge_results(parts: list) -> dict:
+    """
+    يدمج قائمة نتائج parse_tagged_response.
+    """
+    merged = {
+        "الفريق_الأول": None,
+        "الفريق_الثاني": None,
+        "تاريخ_البدء": None,
+        "تاريخ_الانتهاء": None,
+        "ملخص_الاتفاقية": "",
+        "المواد": [],
+        "فقرة_الكفالات": "",
+        "الشروط_الخاصة": "",
+        "الشروط_العامة": ""
     }
+    def first_nonempty(cur, new):
+        return cur if (cur and str(cur).strip()) else (new if (new and str(new).strip()) else cur)
+
+    for p in parts:
+        merged["الفريق_الأول"]    = first_nonempty(merged["الفريق_الأول"],    p.get("الفريق_الأول"))
+        merged["الفريق_الثاني"]   = first_nonempty(merged["الفريق_الثاني"],   p.get("الفريق_الثاني"))
+        merged["تاريخ_البدء"]     = first_nonempty(merged["تاريخ_البدء"],     p.get("تاريخ_البدء"))
+        merged["تاريخ_الانتهاء"]  = first_nonempty(merged["تاريخ_الانتهاء"],  p.get("تاريخ_الانتهاء"))
+
+        if p.get("ملخص_الاتفاقية"):
+            if merged["ملخص_الاتفاقية"]:
+                merged["ملخص_الاتفاقية"] += "\n• " + p["ملخص_الاتفاقية"].strip()
+            else:
+                merged["ملخص_الاتفاقية"] = "• " + p["ملخص_الاتفاقية"].strip()
+
+        if p.get("المواد"):
+            merged["المواد"].extend(p["المواد"])
+
+        for k in ["فقرة_الكفالات","الشروط_الخاصة","الشروط_العامة"]:
+            if p.get(k):
+                if merged[k]:
+                    merged[k] += "\n" + p[k].strip()
+                else:
+                    merged[k] = p[k].strip()
+
+    return merged
+
+
+def _model_fallbacks(selected: str) -> list:
+    seen, out = set(), []
+    def add(m):
+        if m and m not in seen:
+            seen.add(m); out.append(m)
+
+    add(selected)
+    # إن كان 2.5 جرّب 1.5 من نفس العائلة
+    if "2.5" in selected:
+        add(selected.replace("2.5", "1.5"))
+
+    # مجموعة موسعة من الأسماء الشائعة
+    add("models/gemini-1.5-pro")
+    add("models/gemini-1.5-flash")
+    add("models/gemini-1.5-pro-001")
+    add("models/gemini-1.5-flash-001")
+    return out
+
 # ===========================
 # 5️⃣ تحليل بالـ Gemini
 # ===========================
 def analyze_agreement_with_gemini(text: str, selected_model: str, debug: bool = False) -> dict:
-    prompt = AGREEMENT_PROMPT_TEMPLATE.format(doc_text=text)
+    """
+    أولاً نحاول تحليل كامل النص. إذا فشل (رد فاضي/مرفوض/خطأ)،
+    ننتقل للخطة (ب): تقسيم النص لقطع وتشغيل التحليل على كل قطعة، ثم دمج النتيجة.
+    """
+    prompt_full = AGREEMENT_PROMPT_TEMPLATE.format(doc_text=text)
 
-    def run_once(model_name: str) -> str:
+    def run_once(model_name: str, prompt: str) -> str:
         model = genai.GenerativeModel(model_name=model_name)
-        resp = model.generate_content(prompt, generation_config={"temperature": 0.2, "max_output_tokens": 8192})
+        resp = model.generate_content(
+            prompt,
+            generation_config={"temperature": 0.15, "max_output_tokens": 8192}
+        )
         raw = getattr(resp, "text", "") or ""
         if not raw and getattr(resp, "candidates", None):
             parts = [p.text for c in resp.candidates for p in getattr(c.content, "parts", []) if getattr(p, "text", "")]
             raw = "\n".join(parts)
         return raw
 
-    tried = [selected_model]
-    if "2.5" in selected_model:
-        tried.append(selected_model.replace("2.5", "1.5"))
-    tried += ["models/gemini-1.5-pro", "models/gemini-1.5-flash"]
-
-    for m in tried:
+    # 1) محاولة كاملة مع fallback على الموديلات
+    for m in _model_fallbacks(selected_model):
         try:
-            raw = run_once(m)
+            raw = run_once(m, prompt_full)
             if debug:
-                st.caption(f"📄 Raw from {m}:")
-                st.code(raw[:1200] + ("..." if len(raw) > 1200 else ""))
-            return parse_tagged_response(raw)
-        except Exception:
-            continue
+                st.caption(f"📄 Raw (full) from {m}:")
+                st.code((raw or "")[:1200] + ("..." if raw and len(raw) > 1200 else ""))
+            parsed = parse_tagged_response(raw)
+            # لو كل الحقول فارغة تقريباً، اعتبره فشل منطقي
+            if any([parsed.get("الفريق_الأول"), parsed.get("الفريق_الثاني"), parsed.get("المواد")]):
+                return parsed
+        except Exception as e:
+            if debug:
+                st.warning(f"⚠️ فشل محاولة كاملة على {m}: {type(e).__name__}: {e}")
 
-    raise RuntimeError("❌ فشل التحليل عبر جميع الموديلات")
+    # 2) خطة (ب): تجزئة النص
+    chunks = chunk_text(text, max_chars=10000)
+    parts = []
+    for idx, ch in enumerate(chunks, 1):
+        prompt_chunk = AGREEMENT_PROMPT_TEMPLATE.format(doc_text=ch)
+        ok = False
+        for m in _model_fallbacks(selected_model):
+            try:
+                raw = run_once(m, prompt_chunk)
+                if debug:
+                    st.caption(f"📄 Raw (chunk {idx}/{len(chunks)}) from {m}:")
+                    st.code((raw or "")[:800] + ("..." if raw and len(raw) > 800 else ""))
+                parsed = parse_tagged_response(raw)
+                parts.append(parsed)
+                ok = True
+                break
+            except Exception as e:
+                if debug:
+                    st.warning(f"⚠️ فشل chunk {idx} على {m}: {type(e).__name__}: {e}")
+                continue
+        if not ok and debug:
+            st.error(f"❌ لم ننجح في chunk {idx}")
 
+    if not parts:
+        raise RuntimeError("فشل التحليل عبر جميع الموديلات (كامل + مجزأ).")
+
+    # دمج النتائج الجزئية
+    merged = merge_results(parts)
+    return merged
 
 # ===========================
 # 6️⃣ واجهة Streamlit
