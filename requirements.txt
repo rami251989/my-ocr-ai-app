@@ -1,5 +1,7 @@
 streamlit
 google-cloud-vision
+google-generativeai
 pdfplumber
 Pillow
-google-generativeai
+pandas
+xlsxwriter
