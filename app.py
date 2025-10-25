@@ -65,7 +65,7 @@ def extract_text_any(uploaded_file, dpi: int = 200) -> str:
 
 
 # ===========================
-# 3) Prompt الوسوم (مع تهريب الأقواس)
+# 3) Prompt الوسوم (مواد فقط)
 # ===========================
 AGREEMENT_PROMPT_TEMPLATE = r"""
 أنت مساعد لاستخراج **قائمة المواد فقط** من نص اتفاقية أو عرض.
@@ -98,38 +98,35 @@ AGREEMENT_PROMPT_TEMPLATE = r"""
 {doc_text}
 """
 
+
 # ===========================
 # 4) تحليل الوسوم + تنظيف JSON المواد
 # ===========================
-def _between(s: str, start_tag: str, end_tag: str) -> str:
-    pat = re.compile(re.escape(start_tag) + r"(.*?)" + re.escape(end_tag), re.S)
-    m = pat.search(s)
-    return (m.group(1).strip() if m else "")
-
 def parse_tagged_response(raw: str) -> dict:
     import json, re
-    # إزالة محارف الاتجاه/BOM/Zero-width
     raw = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u200B\u200C\u200D]", "", raw or "").strip()
 
-    # التقط الجزء بين الوسمين
     m = re.search(r"<<<ITEMS_JSON_ARRAY>>>(.*?)<<<END_ITEMS_JSON_ARRAY>>>", raw, flags=re.S)
     items_json = (m.group(1).strip() if m else "")
 
     items = []
     if items_json:
-        # تنظيف شائع
-        items_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", items_json, flags=re.I|re.M).strip()
+        # إزالة code fences إن وُجدت
+        items_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", items_json, flags=re.I | re.M).strip()
+        # تطبيع علامات الاقتباس والفواصل العربية
         items_json = (items_json
                       .replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
                       .replace("،", ",").replace("٫", "."))
-        items_json = re.sub(r",\s*([}\]])", r"\1", items_json)  # فواصل زائدة
-        items_json = re.sub(r'([{,]\s*)([A-Za-z0-9_ء-ي]+)\s*:', r'\1"\2":', items_json)  # اقتباس المفاتيح
-        items_json = re.sub(r'("اسم_المادة"\s*:\s*)(-?\d+(?:\.\d+)?)', r'\1"\2"', items_json)  # اسم_المادة نص
+        # إزالة الفواصل الزائدة قبل الأقواس
+        items_json = re.sub(r",\s*([}\]])", r"\1", items_json)
+        # اقتباس المفاتيح غير المقتبسة
+        items_json = re.sub(r'([{,]\s*)([A-Za-z0-9_ء-ي]+)\s*:', r'\1"\2":', items_json)
+        # اسم_المادة يجب أن يكون نصًا
+        items_json = re.sub(r'("اسم_المادة"\s*:\s*)(-?\d+(?:\.\d+)?)', r'\1"\2"', items_json)
 
         try:
             parsed = json.loads(items_json)
         except Exception:
-            # محاولة ثانية
             try:
                 parsed = json.loads(re.sub(r"\s+\n\s+", "\n", items_json))
             except Exception:
@@ -143,21 +140,17 @@ def parse_tagged_response(raw: str) -> dict:
             items = []
     return {"المواد": items}
 
+
 # ===========================
-# 4.1) أدوات التجزئة والدمج + قائمة الموديلات الاحتياطية
+# 4.1) أدوات التجزئة والدمج + الفالْباكس
 # ===========================
 def chunk_text(text: str, max_chars: int = 10000) -> list:
-    """
-    يقص النص لقطع أقصر حتى لا يرفضه الموديل بسبب الطول.
-    يراعي القص عند نهاية سطر إن أمكن.
-    """
     text = text or ""
     if len(text) <= max_chars:
         return [text]
     chunks, start = [], 0
     while start < len(text):
         end = min(len(text), start + max_chars)
-        # حاول القص عند أقرب سطر، بشرط ألا نرجع كثيراً
         nl = text.rfind("\n", start, end)
         if nl == -1 or nl <= start + int(max_chars * 0.5):
             nl = end
@@ -167,68 +160,36 @@ def chunk_text(text: str, max_chars: int = 10000) -> list:
         start = nl
     return chunks
 
-def merge_results(parts: list) -> dict:
-    """
-    يدمج نتائج متعددة من parse_tagged_response في نتيجة واحدة.
-    يأخذ أول قيمة غير فارغة للحقول الفردية ويجمع الجداول والنصوص.
-    """
-    merged = {
-        "الفريق_الأول": None,
-        "الفريق_الثاني": None,
-        "تاريخ_البدء": None,
-        "تاريخ_الانتهاء": None,
-        "ملخص_الاتفاقية": "",
-        "المواد": [],
-        "فقرة_الكفالات": "",
-        "الشروط_الخاصة": "",
-        "الشروط_العامة": ""
-    }
-
-    def first_nonempty(cur, new):
-        return cur if (cur and str(cur).strip()) else (new if (new and str(new).strip()) else cur)
-
+def merge_items_only(parts: list) -> dict:
+    merged = {"المواد": []}
     for p in parts or []:
-        merged["الفريق_الأول"]    = first_nonempty(merged["الفريق_الأول"],    p.get("الفريق_الأول"))
-        merged["الفريق_الثاني"]   = first_nonempty(merged["الفريق_الثاني"],   p.get("الفريق_الثاني"))
-        merged["تاريخ_البدء"]     = first_nonempty(merged["تاريخ_البدء"],     p.get("تاريخ_البدء"))
-        merged["تاريخ_الانتهاء"]  = first_nonempty(merged["تاريخ_الانتهاء"],  p.get("تاريخ_الانتهاء"))
-
-        if p.get("ملخص_الاتفاقية"):
-            if merged["ملخص_الاتفاقية"]:
-                merged["ملخص_الاتفاقية"] += "\n• " + p["ملخص_الاتفاقية"].strip()
-            else:
-                merged["ملخص_الاتفاقية"] = "• " + p["ملخص_الاتفاقية"].strip()
-
-        if p.get("المواد"):
-            merged["المواد"].extend([x for x in p["المواد"] if isinstance(x, dict)])
-
-        for k in ["فقرة_الكفالات","الشروط_الخاصة","الشروط_العامة"]:
-            if p.get(k):
-                if merged[k]:
-                    merged[k] += "\n" + p[k].strip()
-                else:
-                    merged[k] = p[k].strip()
-
+        its = p.get("المواد") or []
+        merged["المواد"].extend([x for x in its if isinstance(x, dict)])
     return merged
 
-def _model_fallbacks(selected: str) -> list:
+def _sanitize_model_name(name: str) -> str:
+    return (name or "").replace("models/", "").strip()
+
+def _available_fallbacks(selected: str) -> list:
     """
-    يبني قائمة موديلات نجربها بالتسلسل.
+    مقتصر على الموديلات المتاحة في حسابك (2.5/2.0).
+    عدّل الترتيب إذا تحب الدقة (pro) أو السرعة (flash/lite).
     """
-    seen, out = set(), []
+    wanted = []
+    sel = _sanitize_model_name(selected)
     def add(m):
-        if m and m not in seen:
-            seen.add(m); out.append(m)
+        m = _sanitize_model_name(m)
+        if m and m not in wanted:
+            wanted.append(m)
 
-    add(selected)
-    if "2.5" in selected:
-        add(selected.replace("2.5", "1.5"))
-
-    add("models/gemini-1.5-pro")
-    add("models/gemini-1.5-flash")
-    add("models/gemini-1.5-pro-001")
-    add("models/gemini-1.5-flash-001")
-    return out
+    add(sel)
+    add("gemini-2.5-pro")
+    add("gemini-2.5-flash")
+    add("gemini-2.5-flash-lite")
+    add("gemini-2.0-flash")
+    add("gemini-2.0-flash-lite")
+    add("gemini-2.0-flash-exp")
+    return wanted
 
 
 # ===========================
@@ -241,7 +202,6 @@ def _arabic_digits_to_western(s: str) -> str:
     return s.translate(trans)
 
 def _to_float(val):
-    """يحاول تحويل أي تمثيل رقمي (عربي/إنجليزي) إلى float بأمان."""
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -249,14 +209,10 @@ def _to_float(val):
     s = str(val).strip()
     if not s:
         return None
-    # طبّع الأرقام العربية + الفواصل العربية
     s = _arabic_digits_to_western(s)
     s = s.replace("،", ",").replace("٫", ".")
-    # أزل الكلمات الشائعة
     s = re.sub(r"(دينار|JD|د\.|فلس|ضريبة|%)", "", s, flags=re.I).strip()
-    # أزل فواصل الآلاف والمسافات
     s = s.replace(",", "").replace(" ", "")
-    # التقط أول رقم عشري صالح (يدعم السالب)
     m = re.search(r"-?\d+(?:\.\d+)?", s)
     if not m:
         return None
@@ -266,7 +222,6 @@ def _to_float(val):
         return None
 
 def normalize_items_table(items: list):
-    """يعيد DataFrame منظّم + أرقام موحدة + أعمدة مشتقة ومجاميع."""
     import pandas as pd
     cols = [
         "اسم_المادة",
@@ -276,24 +231,20 @@ def normalize_items_table(items: list):
         "القيمة_المشتراة_بالدينار",
         "نسبة_ضريبة_المبيعات",
     ]
-    # ضمان وجود الأعمدة
     norm_rows = []
     for it in (items or []):
         row = {k: it.get(k) for k in cols}
         norm_rows.append(row)
     df = pd.DataFrame(norm_rows, columns=cols)
 
-    # تحويل الأرقام
     for c in ["سعر_الشراء_قبل_الضريبة", "سعر_الشراء_مع_الضريبة", "الكمية_المشتراة_بالحبة",
               "القيمة_المشتراة_بالدينار", "نسبة_ضريبة_المبيعات"]:
         df[c] = df[c].apply(_to_float)
 
-    # نسبة الضريبة: إن كانت بين 1..100 اعتبرها % وقسمها على 100
     df["نسبة_ضريبة_المبيعات"] = df["نسبة_ضريبة_المبيعات"].apply(
         lambda x: (x/100.0) if (x is not None and 1.0 <= x <= 100.0) else x
     )
 
-    # أعمدة مشتقة
     df["قيمة_قبل_الضريبة_(حساب)"] = (
         (df["سعر_الشراء_قبل_الضريبة"].fillna(0.0)) * (df["الكمية_المشتراة_بالحبة"].fillna(0.0))
     )
@@ -301,12 +252,10 @@ def normalize_items_table(items: list):
         (df["سعر_الشراء_مع_الضريبة"].fillna(0.0)) * (df["الكمية_المشتراة_بالحبة"].fillna(0.0))
     )
 
-    # إن كانت "القيمة_المشتراة_بالدينار" فارغة، نملأها بالحساب المتاح
     df["القيمة_المشتراة_بالدينار"] = df["القيمة_المشتراة_بالدينار"].fillna(
         df["قيمة_مع_الضريبة_(حساب)"].where(df["قيمة_مع_الضريبة_(حساب)"] > 0, df["قيمة_قبل_الضريبة_(حساب)"])
     )
 
-    # ترتيب أعمدة العرض
     display_cols = [
         "اسم_المادة",
         "الكمية_المشتراة_بالحبة",
@@ -317,7 +266,6 @@ def normalize_items_table(items: list):
         "قيمة_مع_الضريبة_(حساب)",
         "القيمة_المشتراة_بالدينار",
     ]
-    # مجاميع
     totals = {
         "إجمالي_الكمية": float(df["الكمية_المشتراة_بالحبة"].fillna(0).sum()),
         "إجمالي_قيمة_قبل_الضريبة_(حساب)": float(df["قيمة_قبل_الضريبة_(حساب)"].fillna(0).sum()),
@@ -327,7 +275,6 @@ def normalize_items_table(items: list):
     return df[display_cols], totals
 
 def render_items_table(items: list, title: str = "📦 المواد ضمن الاتفاقية"):
-    """يعرض الجدول + ملخص + أزرار تنزيل."""
     import pandas as pd
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)
@@ -339,17 +286,14 @@ def render_items_table(items: list, title: str = "📦 المواد ضمن ال�
         st.markdown('</div>', unsafe_allow_html=True)
         return
 
-    # عرض الجدول
     st.dataframe(df, use_container_width=True, height=420)
 
-    # ملخص سريع
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("إجمالي الكمية", f"{totals['إجمالي_الكمية']:.0f}")
     c2.metric("إجمالي قبل الضريبة", f"{totals['إجمالي_قيمة_قبل_الضريبة_(حساب)']:.3f}")
     c3.metric("إجمالي مع الضريبة", f"{totals['إجمالي_قيمة_مع_الضريبة_(حساب)']:.3f}")
     c4.metric("إجمالي القيمة المدخلة", f"{totals['إجمالي_القيمة_المشتراة_بالدينار']:.3f}")
 
-    # تنزيل CSV/Excel
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ تنزيل CSV", data=csv_bytes, file_name="items.csv", mime="text/csv")
 
@@ -372,33 +316,41 @@ def render_items_table(items: list, title: str = "📦 المواد ضمن ال�
 # ===========================
 def analyze_agreement_with_gemini(text: str, selected_model: str, debug: bool = False) -> dict:
     """
-    أولاً نحاول تحليل كامل النص. إذا فشل (رد فاضي/مرفوض/خطأ)،
-    ننتقل للخطة (ب): تقسيم النص لقطع وتشغيل التحليل على كل قطعة، ثم دمج النتيجة.
+    نحاول تحليل كامل النص. إذا فشل أو جاء رد محجوب، نجزّئ النص ونحاول ثم ندمج "المواد" فقط.
     """
     prompt_full = AGREEMENT_PROMPT_TEMPLATE.format(doc_text=text)
 
     def run_once(model_name: str, prompt: str) -> str:
+        model_name = _sanitize_model_name(model_name)
         model = genai.GenerativeModel(model_name=model_name)
         resp = model.generate_content(
             prompt,
-            generation_config={"temperature": 0.15, "max_output_tokens": 8192}
+            generation_config={"temperature": 0.15, "max_output_tokens": 8192},
         )
-        raw = getattr(resp, "text", "") or ""
-        if not raw and getattr(resp, "candidates", None):
-            parts = [p.text for c in resp.candidates for p in getattr(c.content, "parts", []) if getattr(p, "text", "")]
-            raw = "\n".join(parts)
-        return raw
+        # لا تعتمد على resp.text؛ استخرج من candidates/parts وتجاوز الردود المحجوبة (finish_reason=2)
+        texts = []
+        for cand in getattr(resp, "candidates", []) or []:
+            fr = getattr(cand, "finish_reason", None)
+            if fr is not None and int(fr) == 2:
+                continue
+            content = getattr(cand, "content", None)
+            if content and getattr(content, "parts", None):
+                for p in content.parts:
+                    t = getattr(p, "text", None)
+                    if t:
+                        texts.append(t)
+        return "\n".join(texts).strip()
 
-    # 1) محاولة كاملة مع fallback على الموديلات
-    for m in _model_fallbacks(selected_model):
+    # 1) محاولة كاملة مع fallback على الموديلات المتاحة
+    for m in _available_fallbacks(selected_model):
         try:
             raw = run_once(m, prompt_full)
             if debug:
                 st.caption(f"📄 Raw (full) from {m}:")
                 st.code((raw or "")[:1200] + ("..." if raw and len(raw) > 1200 else ""))
             parsed = parse_tagged_response(raw)
-            # لو بعض الحقول تملأت أو في مواد، اعتبرها ناجحة
-            if any([parsed.get("الفريق_الأول"), parsed.get("الفريق_الثاني"), parsed.get("المواد")]):
+            # نجاح لو عندنا مواد (حتى لو فاضية بنجرّب التجزئة)
+            if parsed.get("المواد"):
                 return parsed
         except Exception as e:
             if debug:
@@ -410,7 +362,7 @@ def analyze_agreement_with_gemini(text: str, selected_model: str, debug: bool = 
     for idx, ch in enumerate(chunks, 1):
         prompt_chunk = AGREEMENT_PROMPT_TEMPLATE.format(doc_text=ch)
         ok = False
-        for m in _model_fallbacks(selected_model):
+        for m in _available_fallbacks(selected_model):
             try:
                 raw = run_once(m, prompt_chunk)
                 if debug:
@@ -430,9 +382,7 @@ def analyze_agreement_with_gemini(text: str, selected_model: str, debug: bool = 
     if not parts:
         raise RuntimeError("فشل التحليل عبر جميع الموديلات (كامل + مجزأ).")
 
-    # دمج النتائج الجزئية
-    merged = merge_results(parts)
-    return merged
+    return merge_items_only(parts)
 
 
 # ===========================
@@ -449,7 +399,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📑 نظام تحليل اتفاقيات المؤسسة الاستهلاكية العسكرية")
-st.markdown("باستخدام **Google Vision OCR + Gemini AI**")
+st.markdown("باستخدام **Google Vision OCR + Gemini AI** — استخراج المواد فقط")
 
 uploaded = st.file_uploader("📤 ارفع صورة أو ملف PDF", type=["png", "jpg", "jpeg", "pdf"])
 
@@ -469,17 +419,27 @@ st.text_area("📝 النص المستخرج:", st.session_state.get("ocr_text",
 if GEMINI_KEY:
     st.success("✅ مفتاح Gemini صالح.")
     try:
-        models_list = genai.list_models()
-        models = [m.name for m in models_list if "generateContent" in m.supported_generation_methods]
-    except Exception:
-        # fallback للأسماء الشائعة لو فشل list_models
+        # يمكنك تجاهل list_models والاكتفاء بالقائمة الثابتة بالأسفل
+        _ = genai.list_models()
         models = [
-            "models/gemini-1.5-pro",
-            "models/gemini-1.5-flash",
-            "models/gemini-1.5-pro-001",
-            "models/gemini-1.5-flash-001",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-2.0-flash-exp",
+        ]
+    except Exception:
+        models = [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-2.0-flash-exp",
         ]
     selected_model = st.selectbox("اختر الموديل:", models, index=0)
+    selected_model = _sanitize_model_name(selected_model)
 else:
     st.error("❌ لم يتم العثور على مفتاح Gemini")
     selected_model = None
