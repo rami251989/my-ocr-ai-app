@@ -120,11 +120,11 @@ if GEMINI_KEY:
                         full_prompt,
                         generation_config={"temperature": 0.2, "max_output_tokens": 8192},
                         safety_settings=[
-                            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-                            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                            {"category": "HARM_CATEGORY_SEXUAL", "threshold": "BLOCK_NONE"},
-                            {"category": "HARM_CATEGORY_VIOLENCE", "threshold": "BLOCK_NONE"},
+                                {"category": "dangerous", "threshold": "block_none"},
+                                {"category": "harassment", "threshold": "block_none"},
+                                {"category": "hate_speech", "threshold": "block_none"},
+                                {"category": "sexual", "threshold": "block_none"},
+                                {"category": "violence", "threshold": "block_none"},
                         ],
                     )
 
