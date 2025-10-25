@@ -1,3 +1,4 @@
+# app.py
 import os
 import io
 import re
@@ -8,8 +9,13 @@ from typing import List, Dict, Any, Optional, Tuple
 import streamlit as st
 from PIL import Image
 import pdfplumber
+
+# Google Vision
 from google.cloud import vision
+
+# Gemini
 from google import generativeai as genai
+
 
 # =========================
 # إعداد الصفحة والتصميم
@@ -17,49 +23,77 @@ from google import generativeai as genai
 st.set_page_config(page_title="اتفاقيات المؤسسة العسكرية", page_icon="📄", layout="wide")
 st.markdown("""
 <style>
+/* بطاقات وجداول جميلة */
 .card {
   background: #fff;
-  border-radius: 12px;
+  border-radius: 14px;
   padding: 16px 18px;
-  box-shadow: 0 6px 20px rgba(0,0,0,0.05);
+  box-shadow: 0 6px 22px rgba(0,0,0,0.06);
   border: 1px solid rgba(0,0,0,0.05);
-  margin-bottom: 10px;
+  margin-bottom: 12px;
 }
-.section-title {font-weight:700;font-size:20px;margin:8px 0 6px 0;}
-.metric{display:flex;align-items:center;gap:12px;font-weight:600;}
-.metric .label{color:#666;}
+.section-title {font-weight:800;font-size:20px;margin:4px 0 10px;}
+.metric{display:flex;align-items:center;gap:10px;font-weight:600;}
+.metric .label{color:#6b7280;}
 .metric .value{font-size:17px;}
 </style>
 """, unsafe_allow_html=True)
 
+
 # =========================
-# Safe JSON Loader
+# أدوات JSON آمنة
 # =========================
 def safe_json_loads(text: str):
+    """
+    يحاول تحميل JSON حتى لو أعاد النموذج نصًا ناقص '{' في البداية
+    أو محاطًا بـ ```json ... ```.
+    """
+    import re, json
     if not text:
-        raise ValueError("نص فارغ من الموديل")
+        raise ValueError("نص فارغ من النموذج")
+
     s = text.strip()
-    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.IGNORECASE | re.MULTILINE).strip()
+    # إزالة code fences
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s,
+               flags=re.IGNORECASE | re.MULTILINE).strip()
+
+    # إذا بدأ بمفتاح JSON بدون '{' لفّه بأقواس
+    if s and s[0] != "{" and s.lstrip().startswith('"'):
+        s = "{\n" + s
+        if not s.rstrip().endswith("}"):
+            s = s.rstrip().rstrip(",") + "\n}"
+
+    # محاولة مباشرة
     try:
         return json.loads(s)
     except Exception:
         pass
+
+    # اقتناص أول كائن { ... } متوازن
     start, end = s.find("{"), s.rfind("}")
     if start != -1 and end != -1 and end > start:
+        candidate = s[start:end+1]
         try:
-            return json.loads(s[start:end+1])
-        except Exception:
-            candidate = re.sub(r",\s*([}\]])", r"\\1", s[start:end+1])
             return json.loads(candidate)
-    raise ValueError(f"تعذر تحويل الاستجابة إلى JSON: {s[:150]}")
+        except Exception:
+            # إزالة فواصل زائدة قبل الأقواس
+            candidate2 = re.sub(r",\s*([}\]])", r"\1", candidate)
+            return json.loads(candidate2)
+
+    raise ValueError(f"تعذّر تحويل الاستجابة إلى JSON. جزء من النص: {s[:200]}")
+
 
 # =========================
-# Google Vision Setup
+# Google Vision: تهيئة
 # =========================
 @st.cache_resource
-def setup_google_vision_client():
+def setup_google_vision_client() -> Optional[vision.ImageAnnotatorClient]:
     try:
         key_b64 = st.secrets["GOOGLE_VISION_KEY_B64"]
+    except KeyError:
+        st.error("❌ لم يتم العثور على GOOGLE_VISION_KEY_B64 في Secrets.")
+        return None
+    try:
         key_bytes = base64.b64decode(key_b64)
         with open("google_vision.json", "wb") as f:
             f.write(key_bytes)
@@ -69,144 +103,347 @@ def setup_google_vision_client():
         st.error(f"❌ خطأ في تهيئة Google Vision: {e}")
         return None
 
-def pdf_bytes_to_images(pdf_bytes, dpi=200):
-    imgs = []
+
+# =========================
+# OCR: PDF -> صور -> Vision
+# =========================
+def pdf_bytes_to_images(pdf_bytes: bytes, dpi: int = 200) -> List[Image.Image]:
+    images: List[Image.Image] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            imgs.append(page.to_image(resolution=dpi).original.convert("RGB"))
-    return imgs
+            pil = page.to_image(resolution=dpi).original
+            images.append(pil.convert("RGB"))
+    return images
 
-def extract_text_any(client, uploaded, dpi=200):
-    name = uploaded.name.lower()
-    data = uploaded.read()
+def extract_text_from_image(client: vision.ImageAnnotatorClient, pil: Image.Image) -> str:
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    gimg = vision.Image(content=buf.getvalue())
+    resp = client.document_text_detection(image=gimg)
+    if resp.error.message:
+        raise RuntimeError(resp.error.message)
+    if resp.full_text_annotation and resp.full_text_annotation.text:
+        return resp.full_text_annotation.text
+    if resp.text_annotations:
+        return resp.text_annotations[0].description
+    return ""
+
+def extract_text_any(client: vision.ImageAnnotatorClient, uploaded_file, dpi: int = 200) -> str:
+    name = (uploaded_file.name or "").lower()
+    data = uploaded_file.read()
     if name.endswith(".pdf"):
-        pages = pdf_bytes_to_images(data, dpi)
-        return "\n\n--- صفحة جديدة ---\n\n".join([
-            client.document_text_detection(image=vision.Image(content=io.BytesIO(
-                (lambda buf: (img.save(buf, format='PNG'), buf.getvalue())[1])(io.BytesIO())
-            ).getvalue())).full_text_annotation.text
-            for img in pages
-        ])
+        pages = pdf_bytes_to_images(data, dpi=dpi)
+        parts = [extract_text_from_image(client, p).strip() for p in pages]
+        return "\n\n--- صفحة جديدة ---\n\n".join(parts).strip()
     else:
-        buf = io.BytesIO()
-        Image.open(io.BytesIO(data)).convert("RGB").save(buf, format="PNG")
-        content = buf.getvalue()
-        return client.document_text_detection(image=vision.Image(content=content)).full_text_annotation.text
+        pil = Image.open(io.BytesIO(data)).convert("RGB")
+        return extract_text_from_image(client, pil).strip()
+
 
 # =========================
-# Gemini Setup + تحليل الاتفاقية
+# Gemini: تهيئة + قائمة الموديلات
 # =========================
 @st.cache_resource
-def setup_gemini():
+def setup_gemini_and_list_models() -> Tuple[Optional[str], List[str]]:
     api = st.secrets.get("GEMINI_API_KEY", "")
     if not api:
-        return None
-    genai.configure(api_key=api)
-    return api
+        return None, []
+    try:
+        genai.configure(api_key=api)
+        models = []
+        try:
+            for m in genai.list_models():
+                if getattr(m, "supported_generation_methods", None) and \
+                   "generateContent" in m.supported_generation_methods:
+                    models.append(m.name)
+        except Exception:
+            # بعض البيئات قد تمنع سرد الموديلات
+            models = []
+        return api, models
+    except Exception:
+        return None, []
 
-AGREEMENT_PROMPT = """
-أنت مساعد ذكي لتحليل الاتفاقيات للمؤسسة الاستهلاكية العسكرية.
-استخرج القيم التالية بصيغة JSON:
+
+# =========================
+# Prompt + Schema للتحليل
+# =========================
+AGREEMENT_PROMPT_TEMPLATE = """
+أنت مساعد خبير في تحليل الاتفاقيات والعروض الخاصة بـ "المؤسسة الاستهلاكية العسكرية".
+
+المطلوب من النص التالي:
+- تحديد "الفريق الأول" و"الفريق الثاني".
+- استخراج "تاريخ بدء الاتفاقية" و"تاريخ انتهائها" بصيغة YYYY-MM-DD إن أمكن.
+- استخراج "ملخص الاتفاقية" بشكل موجز وواضح.
+- استخراج "قائمة المواد" في جدول منظّم، لكل مادة الحقول التالية (أرقام فقط بدون وحدات):
+  * اسم_المادة (نص)
+  * سعر_الشراء_قبل_الضريبة (قيمة عشرية موحدة بدينار: اجمع "الدينار" + "الفلس/1000" إن ظهرت منفصلة)
+  * سعر_الشراء_مع_الضريبة (قيمة عشرية موحدة)
+  * الكمية_المشتراة_بالحبة (عدد صحيح)
+  * القيمة_المشتراة_بالدينار (قيمة عشرية)
+  * نسبة_ضريبة_المبيعات (قيمة عشرية للنسبة مثل 0.16)
+- استخراج فقرات نصية:
+  * فقرة_الكفالات
+  * الشروط_الخاصة
+  * الشروط_العامة
+
+أعد **JSON فقط** بالهيكل التالي:
+
 {
- "الفريق_الأول": "...",
- "الفريق_الثاني": "...",
- "تاريخ_البدء": "YYYY-MM-DD",
- "تاريخ_الانتهاء": "YYYY-MM-DD",
- "ملخص_الاتفاقية": "...",
- "المواد": [
-   {
-     "اسم_المادة": "...",
-     "سعر_الشراء_قبل_الضريبة": 0.0,
-     "سعر_الشراء_مع_الضريبة": 0.0,
-     "الكمية_المشتراة_بالحبة": 0,
-     "القيمة_المشتراة_بالدينار": 0.0,
-     "نسبة_ضريبة_المبيعات": 0.0
-   }
- ],
- "فقرة_الكفالات": "...",
- "الشروط_الخاصة": "...",
- "الشروط_العامة": "..."
+  "الفريق_الأول": "...",
+  "الفريق_الثاني": "...",
+  "تاريخ_البدء": "YYYY-MM-DD or null",
+  "تاريخ_الانتهاء": "YYYY-MM-DD or null",
+  "ملخص_الاتفاقية": "...",
+  "المواد": [
+    {
+      "اسم_المادة": "...",
+      "سعر_الشراء_قبل_الضريبة": 0.0,
+      "سعر_الشراء_مع_الضريبة": 0.0,
+      "الكمية_المشتراة_بالحبة": 0,
+      "القيمة_المشتراة_بالدينار": 0.0,
+      "نسبة_ضريبة_المبيعات": 0.0
+    }
+  ],
+  "فقرة_الكفالات": "...",
+  "الشروط_الخاصة": "...",
+  "الشروط_العامة": "..."
 }
+
 النص:
 ----------------
 {doc_text}
 """
 
-def analyze_agreement_with_gemini(text):
-    schema = {
-        "type": "object",
-        "properties": {
-            "الفريق_الأول": {"type": ["string", "null"]},
-            "الفريق_الثاني": {"type": ["string", "null"]},
-            "تاريخ_البدء": {"type": ["string", "null"]},
-            "تاريخ_الانتهاء": {"type": ["string", "null"]},
-            "ملخص_الاتفاقية": {"type": ["string", "null"]},
-            "المواد": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "اسم_المادة": {"type": ["string", "null"]},
-                        "سعر_الشراء_قبل_الضريبة": {"type": ["number", "null"]},
-                        "سعر_الشراء_مع_الضريبة": {"type": ["number", "null"]},
-                        "الكمية_المشتراة_بالحبة": {"type": ["number", "null"]},
-                        "القيمة_المشتراة_بالدينار": {"type": ["number", "null"]},
-                        "نسبة_ضريبة_المبيعات": {"type": ["number", "null"]}
-                    },
-                    "required": ["اسم_المادة"]
-                }
-            },
-            "فقرة_الكفالات": {"type": ["string", "null"]},
-            "الشروط_الخاصة": {"type": ["string", "null"]},
-            "الشروط_العامة": {"type": ["string", "null"]}
-        }
-    }
-    model = genai.GenerativeModel("gemini-1.5-pro")
-    prompt = AGREEMENT_PROMPT.format(doc_text=text)
-    resp = model.generate_content(
-        prompt,
-        generation_config={
-            "response_mime_type": "application/json",
-            "response_schema": schema,
-            "temperature": 0.2
+AGREEMENT_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "الفريق_الأول": {"type": ["string", "null"]},
+        "الفريق_الثاني": {"type": ["string", "null"]},
+        "تاريخ_البدء": {"type": ["string", "null"]},
+        "تاريخ_الانتهاء": {"type": ["string", "null"]},
+        "ملخص_الاتفاقية": {"type": ["string", "null"]},
+        "المواد": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "اسم_المادة": {"type": ["string", "null"]},
+                    "سعر_الشراء_قبل_الضريبة": {"type": ["number", "null"]},
+                    "سعر_الشراء_مع_الضريبة": {"type": ["number", "null"]},
+                    "الكمية_المشتراة_بالحبة": {"type": ["integer", "number", "null"]},
+                    "القيمة_المشتراة_بالدينار": {"type": ["number", "null"]},
+                    "نسبة_ضريبة_المبيعات": {"type": ["number", "null"]}
+                },
+                "required": ["اسم_المادة"],
+                "additionalProperties": True
+            }
         },
-    )
-    raw = getattr(resp, "text", "") or ""
-    return safe_json_loads(raw)
+        "فقرة_الكفالات": {"type": ["string", "null"]},
+        "الشروط_الخاصة": {"type": ["string", "null"]},
+        "الشروط_العامة": {"type": ["string", "null"]}
+    },
+    "required": [
+        "الفريق_الأول", "الفريق_الثاني", "المواد"
+    ],
+    "additionalProperties": False
+}
+
+
+# =========================
+# تحليل الاتفاقية عبر Gemini (مع اختيار الموديل + fallback + safe JSON)
+# =========================
+def analyze_agreement_with_gemini(text: str, model_name: str) -> Dict[str, Any]:
+    prompt = AGREEMENT_PROMPT_TEMPLATE.format(doc_text=text)
+
+    gen_cfg = {
+        "response_mime_type": "application/json",
+        "response_schema": AGREEMENT_JSON_SCHEMA,
+        "temperature": 0.2,
+        "max_output_tokens": 8192
+    }
+
+    # جرّب المختار ثم أشهر موديلين
+    tried = []
+    for m in [model_name, "gemini-1.5-flash", "gemini-1.5-pro"]:
+        if m in tried:
+            continue
+        tried.append(m)
+        try:
+            model = genai.GenerativeModel(m)
+            resp = model.generate_content(prompt, generation_config=gen_cfg)
+
+            raw = getattr(resp, "text", "") or ""
+            if not raw and getattr(resp, "candidates", None):
+                parts = []
+                for c in resp.candidates:
+                    for p in getattr(c.content, "parts", []):
+                        if getattr(p, "text", ""):
+                            parts.append(p.text)
+                raw = "\n".join(parts)
+
+            return safe_json_loads(raw)
+        except Exception as e:
+            # يمكنك فتح السطر التالي للتشخيص:
+            # st.warning(f"موديل {m} أخفق: {e}")
+            continue
+
+    raise RuntimeError(f"فشل التحليل عبر Gemini. جربنا: {tried}")
+
 
 # =========================
 # واجهة Streamlit
 # =========================
-st.title("📑 محلل اتفاقيات المؤسسة العسكرية")
-st.write("ارفع ملف PDF أو صورة، وسيتولى الذكاء الاصطناعي استخراج وتحليل الاتفاقية بدقة وهيكلة البيانات.")
+st.title("📑 محلّل اتفاقيات المؤسسة الاستهلاكية العسكرية")
+st.write("ارفع ملف PDF/صورة → OCR → تحليل بالذكاء الاصطناعي وإخراج منظّم وجميل.")
 
 with st.sidebar:
-    dpi = st.slider("دقة OCR", 120, 300, 200, 20)
+    st.header("الإعدادات")
+    dpi = st.slider("دقة OCR (DPI)", 120, 320, 200, step=20)
 
-uploaded = st.file_uploader("📂 ارفع الاتفاقية", type=["pdf", "png", "jpg", "jpeg"])
-if uploaded and st.button("🚀 تشغيل OCR"):
+# رفع وتشغيل OCR
+st.subheader("1) رفع الملف وتشغيل OCR")
+uploaded = st.file_uploader("📂 اختر الاتفاقية (PDF/PNG/JPG)", type=["pdf", "png", "jpg", "jpeg"])
+b1, b2 = st.columns(2)
+if uploaded and b1.button("✨ تشغيل OCR"):
     client = setup_google_vision_client()
     if client:
-        with st.spinner("🧠 استخراج النص..."):
-            text = extract_text_any(client, uploaded, dpi)
-            st.session_state["ocr_text"] = text
-            st.success("✅ تم استخراج النص.")
-st.text_area("📜 النص المستخرج:", st.session_state.get("ocr_text", ""), height=250)
-
-if st.button("🤖 تحليل الاتفاقية"):
-    api = setup_gemini()
-    if not api:
-        st.error("❌ تأكد من وضع مفتاح GEMINI_API_KEY في secrets.")
-    elif not st.session_state.get("ocr_text"):
-        st.warning("⚠️ لم يتم استخراج نص بعد.")
-    else:
-        with st.spinner("🔍 جاري التحليل..."):
+        with st.spinner("🧠 استخراج النص عبر Google Vision..."):
             try:
-                result = analyze_agreement_with_gemini(st.session_state["ocr_text"])
-                st.success("✅ تم تحليل الاتفاقية.")
-                st.json(result)
+                uploaded.seek(0)
+                text = extract_text_any(client, uploaded, dpi=dpi)
+                text = (text or "").replace("\x0c", "\n").strip()
+                st.session_state["ocr_text"] = text
+                st.success("✅ تم استخراج النص.")
             except Exception as e:
-                st.error(f"❌ فشل التحليل: {e}")
+                st.error(f"❌ فشل OCR: {e}")
+
+if b2.button("🧹 تنظيف النص"):
+    t = st.session_state.get("ocr_text", "")
+    if t:
+        st.session_state["ocr_text"] = t.strip()
+        st.success("✅ تم التنظيف.")
+    else:
+        st.warning("لا يوجد نص بعد.")
+
+ocr_text = st.session_state.get("ocr_text", "")
+st.text_area("🧾 النص المستخرج:", ocr_text, height=260)
+if ocr_text:
+    st.download_button("⬇️ تنزيل النص", data=ocr_text.encode("utf-8"),
+                       file_name="ocr_text.txt", mime="text/plain")
+
+# اتصال Gemini + اختيار الموديل
+st.subheader("2) الاتصال بـ Gemini واختيار الموديل")
+api_key, available_models = setup_gemini_and_list_models()
+if not api_key:
+    st.error("❌ GEMINI_API_KEY غير موجود في Secrets.")
+    st.stop()
+
+if available_models:
+    st.success("✅ مفتاح Gemini صالح.")
+    st.caption("موديلات متاحة (أول 5):")
+    st.code(", ".join(available_models[:5]) + (" ..." if len(available_models) > 5 else ""))
+else:
+    st.warning("⚠️ تعذر سرد الموديلات، سنستخدم الأسماء الشائعة.")
+
+selected_model = st.selectbox(
+    "اختر الموديل",
+    options=(available_models or ["gemini-1.5-flash", "gemini-1.5-pro"]),
+    index=0
+)
+
+# تشغيل التحليل
+st.subheader("3) تحليل الاتفاقية وإظهار النتائج")
+if st.button("🤖 تحليل الاتفاقية"):
+    if not ocr_text.strip():
+        st.warning("⚠️ لم يتم استخراج نص بعد.")
+        st.stop()
+    with st.spinner("🔍 جاري التحليل عبر Gemini..."):
+        try:
+            result = analyze_agreement_with_gemini(ocr_text, selected_model)
+            st.success("✅ تم التحليل وهيكلة البيانات.")
+
+            # ===== عرض مرتب وجميل =====
+            # بطاقات العلوية
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">👥 الأطراف</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric"><span class="label">الفريق الأول:</span><span class="value">{result.get("الفريق_الأول","—")}</span></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric"><span class="label">الفريق الثاني:</span><span class="value">{result.get("الفريق_الثاني","—")}</span></div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+            with c2:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">🗓️ المدة</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric"><span class="label">تاريخ البدء:</span><span class="value">{result.get("تاريخ_البدء","—")}</span></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric"><span class="label">تاريخ الانتهاء:</span><span class="value">{result.get("تاريخ_الانتهاء","—")}</span></div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            # ملخص
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">🧾 ملخص الاتفاقية</div>', unsafe_allow_html=True)
+            st.write(result.get("ملخص_الاتفاقية", "—"))
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # جدول المواد
+            import pandas as pd
+            items = result.get("المواد", []) or []
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">📦 المواد ضمن الاتفاقية</div>', unsafe_allow_html=True)
+            if items:
+                df = pd.DataFrame(items, columns=[
+                    "اسم_المادة",
+                    "سعر_الشراء_قبل_الضريبة",
+                    "سعر_الشراء_مع_الضريبة",
+                    "الكمية_المشتراة_بالحبة",
+                    "القيمة_المشتراة_بالدينار",
+                    "نسبة_ضريبة_المبيعات"
+                ])
+                # أعمدة حسابية اختيارية
+                try:
+                    df["قيمة_قبل_الضريبة_(حساب)"] = df["سعر_الشراء_قبل_الضريبة"].astype(float) * df["الكمية_المشتراة_بالحبة"].fillna(0).astype(float)
+                except Exception:
+                    pass
+                try:
+                    df["قيمة_مع_الضريبة_(حساب)"] = df["سعر_الشراء_مع_الضريبة"].astype(float) * df["الكمية_المشتراة_بالحبة"].fillna(0).astype(float)
+                except Exception:
+                    pass
+
+                st.dataframe(df, use_container_width=True, height=380)
+                st.download_button("⬇️ تنزيل المواد (CSV)", data=df.to_csv(index=False).encode("utf-8"),
+                                   file_name="items.csv", mime="text/csv")
+            else:
+                st.info("لا توجد مواد مستخرجة.")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # فقرات
+            c3, c4, c5 = st.columns(3)
+            with c3:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">🛡️ فقرة الكفالات</div>', unsafe_allow_html=True)
+                st.write(result.get("فقرة_الكفالات", "—"))
+                st.markdown('</div>', unsafe_allow_html=True)
+            with c4:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">⚙️ الشروط الخاصة</div>', unsafe_allow_html=True)
+                st.write(result.get("الشروط_الخاصة", "—"))
+                st.markdown('</div>', unsafe_allow_html=True)
+            with c5:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">📜 الشروط العامة</div>', unsafe_allow_html=True)
+                st.write(result.get("الشروط_العامة", "—"))
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            # تنزيل JSON كامل
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">⬇️ تنزيل النتيجة الكاملة</div>', unsafe_allow_html=True)
+            st.download_button("تحميل JSON كامل",
+                               data=json.dumps(result, ensure_ascii=False, indent=2),
+                               file_name="agreement_analysis.json",
+                               mime="application/json")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        except Exception as e:
+            st.error(f"❌ فشل التحليل: {e}")
 
 st.markdown("---")
-st.caption("📘 يستخدم Google Vision + Gemini لتحليل الوثائق الرسمية بدقة.")
+st.caption("تحليل الوثائق الرسمية بدقة باستخدام Google Vision + Gemini.")
