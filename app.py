@@ -221,6 +221,95 @@ def _model_fallbacks(selected: str) -> list:
     add("models/gemini-1.5-flash-001")
     return out
 
+
+# ===========================
+# أدوات التجزئة والدمج + قائمة الموديلات الاحتياطية
+# ===========================
+def chunk_text(text: str, max_chars: int = 10000) -> list:
+    """
+    يقص النص لقطع أقصر حتى لا يرفضه الموديل بسبب الطول.
+    يراعي القص عند نهاية سطر إن أمكن.
+    """
+    text = text or ""
+    if len(text) <= max_chars:
+        return [text]
+    chunks, start = [], 0
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        # حاول القص عند أقرب سطر، بشرط ألا نرجع كثيراً
+        nl = text.rfind("\n", start, end)
+        if nl == -1 or nl <= start + int(max_chars * 0.5):
+            nl = end
+        chunk = text[start:nl].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = nl
+    return chunks
+
+def merge_results(parts: list) -> dict:
+    """
+    يدمج نتائج متعددة من parse_tagged_response في نتيجة واحدة.
+    يأخذ أول قيمة غير فارغة للحقول الفردية ويجمع الجداول والنصوص.
+    """
+    merged = {
+        "الفريق_الأول": None,
+        "الفريق_الثاني": None,
+        "تاريخ_البدء": None,
+        "تاريخ_الانتهاء": None,
+        "ملخص_الاتفاقية": "",
+        "المواد": [],
+        "فقرة_الكفالات": "",
+        "الشروط_الخاصة": "",
+        "الشروط_العامة": ""
+    }
+
+    def first_nonempty(cur, new):
+        return cur if (cur and str(cur).strip()) else (new if (new and str(new).strip()) else cur)
+
+    for p in parts or []:
+        merged["الفريق_الأول"]    = first_nonempty(merged["الفريق_الأول"],    p.get("الفريق_الأول"))
+        merged["الفريق_الثاني"]   = first_nonempty(merged["الفريق_الثاني"],   p.get("الفريق_الثاني"))
+        merged["تاريخ_البدء"]     = first_nonempty(merged["تاريخ_البدء"],     p.get("تاريخ_البدء"))
+        merged["تاريخ_الانتهاء"]  = first_nonempty(merged["تاريخ_الانتهاء"],  p.get("تاريخ_الانتهاء"))
+
+        if p.get("ملخص_الاتفاقية"):
+            if merged["ملخص_الاتفاقية"]:
+                merged["ملخص_الاتفاقية"] += "\n• " + p["ملخص_الاتفاقية"].strip()
+            else:
+                merged["ملخص_الاتفاقية"] = "• " + p["ملخص_الاتفاقية"].strip()
+
+        if p.get("المواد"):
+            merged["المواد"].extend([x for x in p["المواد"] if isinstance(x, dict)])
+
+        for k in ["فقرة_الكفالات","الشروط_الخاصة","الشروط_العامة"]:
+            if p.get(k):
+                if merged[k]:
+                    merged[k] += "\n" + p[k].strip()
+                else:
+                    merged[k] = p[k].strip()
+
+    return merged
+
+def _model_fallbacks(selected: str) -> list:
+    """
+    يبني قائمة موديلات نجربها بالتسلسل.
+    """
+    seen, out = set(), []
+    def add(m):
+        if m and m not in seen:
+            seen.add(m); out.append(m)
+
+    add(selected)
+    if "2.5" in selected:
+        add(selected.replace("2.5", "1.5"))
+
+    add("models/gemini-1.5-pro")
+    add("models/gemini-1.5-flash")
+    add("models/gemini-1.5-pro-001")
+    add("models/gemini-1.5-flash-001")
+    return out
+
+
 # ===========================
 # 5️⃣ تحليل بالـ Gemini
 # ===========================
