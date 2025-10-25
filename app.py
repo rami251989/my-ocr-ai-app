@@ -308,6 +308,7 @@ def analyze_agreement_with_gemini(text: str, selected_model: str, debug: bool = 
         if use_schema:
             gen_cfg["response_schema"] = AGREEMENT_JSON_SCHEMA
         resp = model.generate_content(prompt, generation_config=gen_cfg)
+
         raw = getattr(resp, "text", "") or ""
         if not raw and getattr(resp, "candidates", None):
             parts = []
@@ -323,7 +324,7 @@ def analyze_agreement_with_gemini(text: str, selected_model: str, debug: bool = 
 
     errors = []
     for m in build_model_fallbacks(selected_model):
-        for use_schema in (True, False):  # جرّب مع schema ثم بدون
+        for use_schema in (True, False):
             try:
                 raw = run_once(m, use_schema)
                 return safe_json_loads(raw)
