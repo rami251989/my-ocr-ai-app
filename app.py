@@ -88,10 +88,11 @@ AGREEMENT_PROMPT_TEMPLATE = r"""
 <<<END_DATE_END>>>
 
 <<<SUMMARY>>>
-[ملخص موجز جداً للاتفاقية]
+[3–5 نقاط قصيرة جداً تلخّص الاتفاقية، نقطة لكل سطر تبدأ بـ "- "]
 <<<END_SUMMARY>>>
 
 # المصفوفة التالية فقط بصيغة JSON صحيحة. لا تضف أي نص خارج الأقواس.
+# أولوية قصوى لاستخراج المواد بشكل صحيح.
 # الشروط:
 # - "اسم_المادة": نص (دائماً String)
 # - باقي الحقول أرقام عشرية بالدينار بعد دمج الدينار+الفلس (إن وجدتا منفصلتين بالنص).
@@ -113,24 +114,26 @@ AGREEMENT_PROMPT_TEMPLATE = r"""
 <<<END_ITEMS_JSON_ARRAY>>>
 
 <<<WARRANTIES>>>
-[نص فقرة الكفالات إن وجدت]
+[حوّل فقرة الكفالات إلى نقاط قصيرة جداً، نقطة لكل سطر تبدأ بـ "- "]
 <<<END_WARRANTIES>>>
 
 <<<SPECIAL_TERMS>>>
-[الشروط الخاصة إن وجدت]
+[حوّل الشروط الخاصة إلى نقاط قصيرة جداً، نقطة لكل سطر تبدأ بـ "- "]
 <<<END_SPECIAL_TERMS>>>
 
 <<<GENERAL_TERMS>>>
-[الشروط العامة إن وجدت]
+[حوّل الشروط العامة إلى نقاط قصيرة جداً، نقطة لكل سطر تبدأ بـ "- "]
 <<<END_GENERAL_TERMS>>>
 
 تعليمات مهمة:
+- ركّز على استخراج (التواريخ + المواد) بدقة عالية.
 - وحِّد الأسعار بالدينار فقط (اجمع الدينار + الفلس/1000 إن ظهرت منفصلة).
 - التزم بالبنية أعلاه حرفياً.
 النص:
 ----------------
 {doc_text}
 """
+
 
 
 # ===========================
@@ -151,6 +154,21 @@ def parse_tagged_response(raw: str) -> dict:
         m = pat.search(raw)
         return (m.group(1).strip() if m else "")
 
+    def to_points(text: str) -> list:
+        """حوّل سطور تبدأ بـ '- ' إلى نقاط قصيرة نظيفة."""
+        if not text:
+            return []
+        lines = [re.sub(r"^\s*-\s*", "", ln).strip() for ln in text.splitlines() if ln.strip()]
+        # احتفظ فقط بالسطر الذي كان يبدأ بـ "- " أو قصير جداً
+        out = []
+        for ln in lines:
+            if ln.startswith("- "):
+                ln = ln[2:].strip()
+            out.append(ln)
+        # فلترة الفراغات وتحديد حد أقصى منطقي
+        out = [x for x in out if x]
+        return out[:20]  # سقف 20 نقطة
+
     items_json = g("<<<ITEMS_JSON_ARRAY>>>", "<<<END_ITEMS_JSON_ARRAY>>>").strip()
     items = []
     if items_json:
@@ -162,22 +180,20 @@ def parse_tagged_response(raw: str) -> dict:
                       .replace("،", ",").replace("٫", "."))
         # إزالة الفواصل الزائدة قبل الأقواس
         items_json = re.sub(r",\s*([}\]])", r"\1", items_json)
-        # اقتباس المفاتيح غير المقتبسة (عربية/إنجليزية/أرقام/شرطة سفلية)
+        # اقتباس المفاتيح غير المقتبسة
         items_json = re.sub(r'([{,]\s*)([A-Za-z0-9_ء-ي]+)\s*:', r'\1"\2":', items_json)
-        # في بعض الأحيان اسم_المادة يُعاد رقمًا → اقتبسه كسلسلة
+        # أحياناً اسم_المادة يُعاد رقمًا → اقتبسه كسلسلة
         items_json = re.sub(r'("اسم_المادة"\s*:\s*)(-?\d+(?:\.\d+)?)', r'\1"\2"', items_json)
 
         try:
             parsed = json.loads(items_json)
         except Exception:
-            # محاولة ثانية بسيطة
             items_json2 = re.sub(r"\s+\n\s+", "\n", items_json)
             try:
                 parsed = json.loads(items_json2)
             except Exception:
                 parsed = []
 
-        # تأكد أن النتيجة قائمة من كائنات
         if isinstance(parsed, dict):
             items = [parsed]
         elif isinstance(parsed, list):
@@ -187,17 +203,27 @@ def parse_tagged_response(raw: str) -> dict:
     else:
         items = []
 
+    summary_txt   = g("<<<SUMMARY>>>",        "<<<END_SUMMARY>>>")
+    warranties    = g("<<<WARRANTIES>>>",     "<<<END_WARRANTIES>>>")
+    special_terms = g("<<<SPECIAL_TERMS>>>",  "<<<END_SPECIAL_TERMS>>>")
+    general_terms = g("<<<GENERAL_TERMS>>>",  "<<<END_GENERAL_TERMS>>>")
+
     return {
-        "الفريق_الأول": g("<<<TEAM_A>>>", "<<<END_TEAM_A>>>"),
-        "الفريق_الثاني": g("<<<TEAM_B>>>", "<<<END_TEAM_B>>>"),
-        "تاريخ_البدء": g("<<<DATE_START>>>", "<<<END_DATE_START>>>"),
-        "تاريخ_الانتهاء": g("<<<DATE_END>>>", "<<<END_DATE_END>>>"),
-        "ملخص_الاتفاقية": g("<<<SUMMARY>>>", "<<<END_SUMMARY>>>"),
+        "الفريق_الأول":   g("<<<TEAM_A>>>", "<<<END_TEAM_A>>>"),
+        "الفريق_الثاني":  g("<<<TEAM_B>>>", "<<<END_TEAM_B>>>"),
+        "تاريخ_البدء":    g("<<<DATE_START>>>", "<<<END_DATE_START>>>"),
+        "تاريخ_الانتهاء": g("<<<DATE_END>>>",   "<<<END_DATE_END>>>"),
+        "ملخص_الاتفاقية": summary_txt,             # النص الأصلي (احتياط)
+        "ملخص_الاتفاقية_نقاط": to_points(summary_txt),
         "المواد": items,
-        "فقرة_الكفالات": g("<<<WARRANTIES>>>", "<<<END_WARRANTIES>>>"),
-        "الشروط_الخاصة": g("<<<SPECIAL_TERMS>>>", "<<<END_SPECIAL_TERMS>>>"),
-        "الشروط_العامة": g("<<<GENERAL_TERMS>>>", "<<<END_GENERAL_TERMS>>>")
+        "فقرة_الكفالات": warranties,               # النص الأصلي (احتياط)
+        "فقرة_الكفالات_نقاط": to_points(warranties),
+        "الشروط_الخاصة": special_terms,            # النص الأصلي (احتياط)
+        "الشروط_الخاصة_نقاط": to_points(special_terms),
+        "الشروط_العامة": general_terms,            # النص الأصلي (احتياط)
+        "الشروط_العامة_نقاط": to_points(general_terms),
     }
+
 
 
 # ===========================
