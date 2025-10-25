@@ -132,18 +132,38 @@ def _between(s: str, start_tag: str, end_tag: str) -> str:
     pat = re.compile(re.escape(start_tag) + r"(.*?)" + re.escape(end_tag), re.S)
     m = pat.search(s)
     return (m.group(1).strip() if m else "")
-
 def parse_tagged_response(raw: str) -> dict:
+    import json, re
     raw = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u200B\u200C\u200D]", "", raw).strip()
 
-    def g(a, b): return _between(raw, a, b)
+    def g(a, b):
+        pat = re.compile(re.escape(a) + r"(.*?)" + re.escape(b), re.S)
+        m = pat.search(raw)
+        return (m.group(1).strip() if m else "")
 
     items_json = g("<<<ITEMS_JSON_ARRAY>>>", "<<<END_ITEMS_JSON_ARRAY>>>").strip()
-    try:
+
+    # ✅ إصلاح الأخطاء قبل التحويل
+    if items_json:
+        # تصحيح علامات الاقتباس
+        items_json = items_json.replace("“", '"').replace("”", '"').replace("’", "'")
+        # حذف الفواصل الزائدة أو القيم الغريبة
         items_json = re.sub(r",\s*\]", "]", items_json)
-        items_json = items_json.replace("“", '"').replace("”", '"')
-        items = json.loads(items_json) if items_json else []
-    except Exception:
+        items_json = re.sub(r",\s*}", "}", items_json)
+        # تأكد أن القيم النصية محاطة بعلامات اقتباس
+        items_json = re.sub(r'("اسم_المادة"\s*:\s*)(\d+)', r'\1"\2"', items_json)
+
+        try:
+            items = json.loads(items_json)
+        except Exception as e:
+            # كخطة احتياطية: نحاول إصلاح JSON يدويًا
+            st.warning(f"⚠️ إصلاح تلقائي للأخطاء في JSON: {e}")
+            items_json_fixed = re.sub(r"([{,]\s*)([A-Za-zء-ي_]+)(\s*:)", r'\1"\2"\3', items_json)
+            try:
+                items = json.loads(items_json_fixed)
+            except Exception:
+                items = []
+    else:
         items = []
 
     return {
