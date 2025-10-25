@@ -1,4 +1,4 @@
-# app.py
+# -*- coding: utf-8 -*-
 import os
 import io
 import re
@@ -18,12 +18,11 @@ from google import generativeai as genai
 
 
 # =========================
-# إعداد الصفحة والتصميم
+# إعداد الصفحة + تنسيق بسيط
 # =========================
-st.set_page_config(page_title="اتفاقيات المؤسسة العسكرية", page_icon="📄", layout="wide")
+st.set_page_config(page_title="اتفاقيات المؤسسة العسكرية - OCR + Gemini", page_icon="📄", layout="wide")
 st.markdown("""
 <style>
-/* بطاقات وجداول جميلة */
 .card {
   background: #fff;
   border-radius: 14px;
@@ -45,31 +44,42 @@ st.markdown("""
 # =========================
 def safe_json_loads(text: str):
     """
-    يحاول تحميل JSON حتى لو أعاد النموذج نصًا ناقص '{' في البداية
-    أو محاطًا بـ ```json ... ```.
+    يحوّل استجابة النموذج إلى JSON حتى لو:
+    - ملفوفة بـ ```json ... ```
+    - بدأت بسطر مفتاح بدون { } → نلفّها تلقائيًا
+    - فيها اقتباسات ذكية “ ” أو ’
+    - بصيغة dict بايثون (single quotes) → نجرب ast.literal_eval
+    - فيها فواصل زائدة قبل } أو ]
     """
-    import re, json
+    import re, json, ast
+
     if not text:
         raise ValueError("نص فارغ من النموذج")
 
     s = text.strip()
-    # إزالة code fences
+
+    # أزل code fences
     s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s,
                flags=re.IGNORECASE | re.MULTILINE).strip()
 
-    # إذا بدأ بمفتاح JSON بدون '{' لفّه بأقواس
-    if s and s[0] != "{" and s.lstrip().startswith('"'):
+    # طبع الاقتباسات الذكية إلى عادية
+    s = s.replace("“", '"').replace("”", '"').replace("„", '"').replace("«", '"').replace("»", '"')
+    s = s.replace("’", "'").replace("‘", "'")
+
+    # لو أول non-space هو quote (بدون {) لفّ النص بأقواس
+    ls = s.lstrip("\ufeff \t\r\n")
+    if ls and ls[0] in ['"', "'"] and not ls.startswith("{"):
         s = "{\n" + s
         if not s.rstrip().endswith("}"):
             s = s.rstrip().rstrip(",") + "\n}"
 
-    # محاولة مباشرة
+    # 1) محاولة JSON مباشر
     try:
         return json.loads(s)
     except Exception:
         pass
 
-    # اقتناص أول كائن { ... } متوازن
+    # 2) اقتنص أول كائن { .. } متوازن
     start, end = s.find("{"), s.rfind("}")
     if start != -1 and end != -1 and end > start:
         candidate = s[start:end+1]
@@ -78,13 +88,26 @@ def safe_json_loads(text: str):
         except Exception:
             # إزالة فواصل زائدة قبل الأقواس
             candidate2 = re.sub(r",\s*([}\]])", r"\1", candidate)
-            return json.loads(candidate2)
+            try:
+                return json.loads(candidate2)
+            except Exception:
+                pass
 
-    raise ValueError(f"تعذّر تحويل الاستجابة إلى JSON. جزء من النص: {s[:200]}")
+    # 3) Python-like dict (single quotes) → ast.literal_eval
+    try:
+        obj = ast.literal_eval(s)
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, (list, tuple)) and obj and isinstance(obj[0], dict):
+            return obj[0]
+    except Exception:
+        pass
+
+    raise ValueError(f"تعذّر تحويل استجابة النموذج إلى JSON. جزء من النص: {s[:250]}")
 
 
 # =========================
-# Google Vision: تهيئة
+# Google Vision: التهيئة
 # =========================
 @st.cache_resource
 def setup_google_vision_client() -> Optional[vision.ImageAnnotatorClient]:
@@ -141,7 +164,7 @@ def extract_text_any(client: vision.ImageAnnotatorClient, uploaded_file, dpi: in
 
 
 # =========================
-# Gemini: تهيئة + قائمة الموديلات
+# Gemini: تهيئة + سرد الموديلات
 # =========================
 @st.cache_resource
 def setup_gemini_and_list_models() -> Tuple[Optional[str], List[str]]:
@@ -157,7 +180,6 @@ def setup_gemini_and_list_models() -> Tuple[Optional[str], List[str]]:
                    "generateContent" in m.supported_generation_methods:
                     models.append(m.name)
         except Exception:
-            # بعض البيئات قد تمنع سرد الموديلات
             models = []
         return api, models
     except Exception:
@@ -230,7 +252,7 @@ AGREEMENT_JSON_SCHEMA: Dict[str, Any] = {
                     "اسم_المادة": {"type": ["string", "null"]},
                     "سعر_الشراء_قبل_الضريبة": {"type": ["number", "null"]},
                     "سعر_الشراء_مع_الضريبة": {"type": ["number", "null"]},
-                    "الكمية_المشتراة_بالحبة": {"type": ["integer", "number", "null"]},
+                    "الكمية_المشتراة_بالحبة": {"type": ["integer","number","null"]},
                     "القيمة_المشتراة_بالدينار": {"type": ["number", "null"]},
                     "نسبة_ضريبة_المبيعات": {"type": ["number", "null"]}
                 },
@@ -242,52 +264,69 @@ AGREEMENT_JSON_SCHEMA: Dict[str, Any] = {
         "الشروط_الخاصة": {"type": ["string", "null"]},
         "الشروط_العامة": {"type": ["string", "null"]}
     },
-    "required": [
-        "الفريق_الأول", "الفريق_الثاني", "المواد"
-    ],
+    "required": ["الفريق_الأول", "الفريق_الثاني", "المواد"],
     "additionalProperties": False
 }
 
 
 # =========================
-# تحليل الاتفاقية عبر Gemini (مع اختيار الموديل + fallback + safe JSON)
+# Fallback لأسماء الموديلات
 # =========================
-def analyze_agreement_with_gemini(text: str, model_name: str) -> Dict[str, Any]:
+def build_model_fallbacks(selected: str) -> list:
+    seen, out = set(), []
+    def add(m):
+        if m and m not in seen:
+            seen.add(m); out.append(m)
+
+    add(selected)
+    if "2.5" in selected:
+        add(selected.replace("2.5", "1.5"))
+
+    add("models/gemini-1.5-flash")
+    add("models/gemini-1.5-pro")
+    return out
+
+
+# =========================
+# تحليل الاتفاقية عبر Gemini
+# =========================
+def analyze_agreement_with_gemini(text: str, selected_model: str, debug: bool = False) -> dict:
     prompt = AGREEMENT_PROMPT_TEMPLATE.format(doc_text=text)
 
-    gen_cfg = {
-        "response_mime_type": "application/json",
-        "response_schema": AGREEMENT_JSON_SCHEMA,
-        "temperature": 0.2,
-        "max_output_tokens": 8192
-    }
+    def run_once(model_name: str, use_schema: bool) -> str:
+        model = genai.GenerativeModel(model_name=model_name)
+        gen_cfg = {
+            "response_mime_type": "application/json",
+            "temperature": 0.2,
+            "max_output_tokens": 8192,
+        }
+        if use_schema:
+            gen_cfg["response_schema"] = AGREEMENT_JSON_SCHEMA
+        resp = model.generate_content(prompt, generation_config=gen_cfg)
+        raw = getattr(resp, "text", "") or ""
+        if not raw and getattr(resp, "candidates", None):
+            parts = []
+            for c in resp.candidates:
+                for p in getattr(c.content, "parts", []):
+                    if getattr(p, "text", ""):
+                        parts.append(p.text)
+            raw = "\n".join(parts)
+        if debug:
+            st.caption(f"📄 Raw ({model_name}, schema={use_schema}):")
+            st.code(raw[:1000] + ("..." if len(raw) > 1000 else ""))
+        return raw
 
-    # جرّب المختار ثم أشهر موديلين
-    tried = []
-    for m in [model_name, "gemini-1.5-flash", "gemini-1.5-pro"]:
-        if m in tried:
-            continue
-        tried.append(m)
-        try:
-            model = genai.GenerativeModel(m)
-            resp = model.generate_content(prompt, generation_config=gen_cfg)
+    errors = []
+    for m in build_model_fallbacks(selected_model):
+        for use_schema in (True, False):  # جرّب مع schema ثم بدون
+            try:
+                raw = run_once(m, use_schema)
+                return safe_json_loads(raw)
+            except Exception as e:
+                errors.append(f"{m} (schema={use_schema}): {e}")
+                continue
 
-            raw = getattr(resp, "text", "") or ""
-            if not raw and getattr(resp, "candidates", None):
-                parts = []
-                for c in resp.candidates:
-                    for p in getattr(c.content, "parts", []):
-                        if getattr(p, "text", ""):
-                            parts.append(p.text)
-                raw = "\n".join(parts)
-
-            return safe_json_loads(raw)
-        except Exception as e:
-            # يمكنك فتح السطر التالي للتشخيص:
-            # st.warning(f"موديل {m} أخفق: {e}")
-            continue
-
-    raise RuntimeError(f"فشل التحليل عبر Gemini. جربنا: {tried}")
+    raise RuntimeError("فشل التحليل عبر Gemini:\n" + "\n".join(errors[:6]))
 
 
 # =========================
@@ -299,8 +338,9 @@ st.write("ارفع ملف PDF/صورة → OCR → تحليل بالذكاء ا�
 with st.sidebar:
     st.header("الإعدادات")
     dpi = st.slider("دقة OCR (DPI)", 120, 320, 200, step=20)
+    debug = st.checkbox("إظهار مخرجات التشخيص (Raw)", value=False)
 
-# رفع وتشغيل OCR
+# 1) رفع وتشغيل OCR
 st.subheader("1) رفع الملف وتشغيل OCR")
 uploaded = st.file_uploader("📂 اختر الاتفاقية (PDF/PNG/JPG)", type=["pdf", "png", "jpg", "jpeg"])
 b1, b2 = st.columns(2)
@@ -331,8 +371,8 @@ if ocr_text:
     st.download_button("⬇️ تنزيل النص", data=ocr_text.encode("utf-8"),
                        file_name="ocr_text.txt", mime="text/plain")
 
-# اتصال Gemini + اختيار الموديل
-st.subheader("2) الاتصال بـ Gemini واختيار الموديل")
+# 2) اتصال Gemini + اختيار الموديل
+st.subheader("2) واختيار الموديل للاتصال بـ Gemini")
 api_key, available_models = setup_gemini_and_list_models()
 if not api_key:
     st.error("❌ GEMINI_API_KEY غير موجود في Secrets.")
@@ -343,15 +383,21 @@ if available_models:
     st.caption("موديلات متاحة (أول 5):")
     st.code(", ".join(available_models[:5]) + (" ..." if len(available_models) > 5 else ""))
 else:
-    st.warning("⚠️ تعذر سرد الموديلات، سنستخدم الأسماء الشائعة.")
+    st.warning("⚠️ تعذر سرد الموديلات. سنستخدم الأسماء الشائعة (models/gemini-1.5-...).")
 
 selected_model = st.selectbox(
-    "اختر الموديل",
-    options=(available_models or ["gemini-1.5-flash", "gemini-1.5-pro"]),
+    "اختر اسم الموديل",
+    options=(available_models or [
+        "models/gemini-2.5-pro-preview-03-25",
+        "models/gemini-2.5-flash-preview-05-20",
+        "models/gemini-2.5-flash",
+        "models/gemini-1.5-flash",
+        "models/gemini-1.5-pro",
+    ]),
     index=0
 )
 
-# تشغيل التحليل
+# 3) تحليل الاتفاقية
 st.subheader("3) تحليل الاتفاقية وإظهار النتائج")
 if st.button("🤖 تحليل الاتفاقية"):
     if not ocr_text.strip():
@@ -359,11 +405,11 @@ if st.button("🤖 تحليل الاتفاقية"):
         st.stop()
     with st.spinner("🔍 جاري التحليل عبر Gemini..."):
         try:
-            result = analyze_agreement_with_gemini(ocr_text, selected_model)
+            result = analyze_agreement_with_gemini(ocr_text, selected_model, debug=debug)
             st.success("✅ تم التحليل وهيكلة البيانات.")
 
-            # ===== عرض مرتب وجميل =====
-            # بطاقات العلوية
+            # ===== عرض مرتب =====
+            # الأطراف + المدة
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -415,7 +461,7 @@ if st.button("🤖 تحليل الاتفاقية"):
                 st.info("لا توجد مواد مستخرجة.")
             st.markdown('</div>', unsafe_allow_html=True)
 
-            # فقرات
+            # فقرات نصية
             c3, c4, c5 = st.columns(3)
             with c3:
                 st.markdown('<div class="card">', unsafe_allow_html=True)
