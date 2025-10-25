@@ -68,38 +68,9 @@ def extract_text_any(uploaded_file, dpi: int = 200) -> str:
 # 3) Prompt الوسوم (مع تهريب الأقواس)
 # ===========================
 AGREEMENT_PROMPT_TEMPLATE = r"""
-أنت مساعد لتحليل اتفاقيات "المؤسسة الاستهلاكية العسكرية".
-أعد الرد **بالضبط** بهذه الوسوم، وبدون أي نص خارجها، وبدون تعليقات أو شروحات:
+أنت مساعد لاستخراج **قائمة المواد فقط** من نص اتفاقية أو عرض.
+أعد الرد **بالضبط** ضمن الوسمين التاليين، ولا تضف أي نص خارجهما:
 
-<<<TEAM_A>>>
-[اكتب اسم الفريق الأول فقط]
-<<<END_TEAM_A>>>
-
-<<<TEAM_B>>>
-[اكتب اسم الفريق الثاني فقط]
-<<<END_TEAM_B>>>
-
-<<<DATE_START>>>
-[تاريخ البدء بصيغة YYYY-MM-DD أو اتركه فارغاً]
-<<<END_DATE_START>>>
-
-<<<DATE_END>>>
-[تاريخ الانتهاء بصيغة YYYY-MM-DD أو اتركه فارغاً]
-<<<END_DATE_END>>>
-
-<<<SUMMARY>>>
-[3–5 نقاط قصيرة جداً تلخّص الاتفاقية، نقطة لكل سطر تبدأ بـ "- "]
-<<<END_SUMMARY>>>
-
-# المصفوفة التالية فقط بصيغة JSON صحيحة. لا تضف أي نص خارج الأقواس.
-# أولوية قصوى لاستخراج المواد بشكل صحيح.
-# الشروط:
-# - "اسم_المادة": نص (دائماً String)
-# - باقي الحقول أرقام عشرية بالدينار بعد دمج الدينار+الفلس (إن وجدتا منفصلتين بالنص).
-# - "الكمية_المشتراة_بالحبة" عدد صحيح (اكتب رقماً فقط).
-# - "نسبة_ضريبة_المبيعات" كقيمة عشرية (مثلاً 0.16 وليس 16%).
-# - لا تعليقات، لا فواصل زائدة قبل ] أو }}.
-# - إن لم توجد مواد، أعد مصفوفة فارغة [].
 <<<ITEMS_JSON_ARRAY>>>
 [
   {{
@@ -113,28 +84,19 @@ AGREEMENT_PROMPT_TEMPLATE = r"""
 ]
 <<<END_ITEMS_JSON_ARRAY>>>
 
-<<<WARRANTIES>>>
-[حوّل فقرة الكفالات إلى نقاط قصيرة جداً، نقطة لكل سطر تبدأ بـ "- "]
-<<<END_WARRANTIES>>>
-
-<<<SPECIAL_TERMS>>>
-[حوّل الشروط الخاصة إلى نقاط قصيرة جداً، نقطة لكل سطر تبدأ بـ "- "]
-<<<END_SPECIAL_TERMS>>>
-
-<<<GENERAL_TERMS>>>
-[حوّل الشروط العامة إلى نقاط قصيرة جداً، نقطة لكل سطر تبدأ بـ "- "]
-<<<END_GENERAL_TERMS>>>
-
 تعليمات مهمة:
-- ركّز على استخراج (التواريخ + المواد) بدقة عالية.
-- وحِّد الأسعار بالدينار فقط (اجمع الدينار + الفلس/1000 إن ظهرت منفصلة).
-- التزم بالبنية أعلاه حرفياً.
+- أعِد مصفوفة JSON صحيحة فقط داخل <<<ITEMS_JSON_ARRAY>>>…<<<END_ITEMS_JSON_ARRAY>>>.
+- "اسم_المادة" نص إجباري.
+- باقي الحقول قيم رقمية (عشرية) بالدينار بعد دمج الدينار + الفلس/1000 إن ظهرت منفصلة.
+- "الكمية_المشتراة_بالحبة" رقم صحيح.
+- "نسبة_ضريبة_المبيعات" كقيمة عشرية (مثلاً 0.16 وليس 16%).
+- لا تعليقات، لا أسطر شرح، لا فواصل زائدة قبل ] أو }}.
+- إن لم توجد مواد، أعد [].
+
 النص:
 ----------------
 {doc_text}
 """
-
-
 
 # ===========================
 # 4) تحليل الوسوم + تنظيف JSON المواد
@@ -147,50 +109,29 @@ def _between(s: str, start_tag: str, end_tag: str) -> str:
 def parse_tagged_response(raw: str) -> dict:
     import json, re
     # إزالة محارف الاتجاه/BOM/Zero-width
-    raw = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u200B\u200C\u200D]", "", raw).strip()
+    raw = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u200B\u200C\u200D]", "", raw or "").strip()
 
-    def g(a, b):
-        pat = re.compile(re.escape(a) + r"(.*?)" + re.escape(b), re.S)
-        m = pat.search(raw)
-        return (m.group(1).strip() if m else "")
+    # التقط الجزء بين الوسمين
+    m = re.search(r"<<<ITEMS_JSON_ARRAY>>>(.*?)<<<END_ITEMS_JSON_ARRAY>>>", raw, flags=re.S)
+    items_json = (m.group(1).strip() if m else "")
 
-    def to_points(text: str) -> list:
-        """حوّل سطور تبدأ بـ '- ' إلى نقاط قصيرة نظيفة."""
-        if not text:
-            return []
-        lines = [re.sub(r"^\s*-\s*", "", ln).strip() for ln in text.splitlines() if ln.strip()]
-        # احتفظ فقط بالسطر الذي كان يبدأ بـ "- " أو قصير جداً
-        out = []
-        for ln in lines:
-            if ln.startswith("- "):
-                ln = ln[2:].strip()
-            out.append(ln)
-        # فلترة الفراغات وتحديد حد أقصى منطقي
-        out = [x for x in out if x]
-        return out[:20]  # سقف 20 نقطة
-
-    items_json = g("<<<ITEMS_JSON_ARRAY>>>", "<<<END_ITEMS_JSON_ARRAY>>>").strip()
     items = []
     if items_json:
-        # إزالة code fences إن وُجدت
-        items_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", items_json, flags=re.IGNORECASE | re.MULTILINE).strip()
-        # تطبيع علامات الاقتباس والفواصل العربية
+        # تنظيف شائع
+        items_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", items_json, flags=re.I|re.M).strip()
         items_json = (items_json
                       .replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
                       .replace("،", ",").replace("٫", "."))
-        # إزالة الفواصل الزائدة قبل الأقواس
-        items_json = re.sub(r",\s*([}\]])", r"\1", items_json)
-        # اقتباس المفاتيح غير المقتبسة
-        items_json = re.sub(r'([{,]\s*)([A-Za-z0-9_ء-ي]+)\s*:', r'\1"\2":', items_json)
-        # أحياناً اسم_المادة يُعاد رقمًا → اقتبسه كسلسلة
-        items_json = re.sub(r'("اسم_المادة"\s*:\s*)(-?\d+(?:\.\d+)?)', r'\1"\2"', items_json)
+        items_json = re.sub(r",\s*([}\]])", r"\1", items_json)  # فواصل زائدة
+        items_json = re.sub(r'([{,]\s*)([A-Za-z0-9_ء-ي]+)\s*:', r'\1"\2":', items_json)  # اقتباس المفاتيح
+        items_json = re.sub(r'("اسم_المادة"\s*:\s*)(-?\d+(?:\.\d+)?)', r'\1"\2"', items_json)  # اسم_المادة نص
 
         try:
             parsed = json.loads(items_json)
         except Exception:
-            items_json2 = re.sub(r"\s+\n\s+", "\n", items_json)
+            # محاولة ثانية
             try:
-                parsed = json.loads(items_json2)
+                parsed = json.loads(re.sub(r"\s+\n\s+", "\n", items_json))
             except Exception:
                 parsed = []
 
@@ -200,31 +141,7 @@ def parse_tagged_response(raw: str) -> dict:
             items = [x for x in parsed if isinstance(x, dict)]
         else:
             items = []
-    else:
-        items = []
-
-    summary_txt   = g("<<<SUMMARY>>>",        "<<<END_SUMMARY>>>")
-    warranties    = g("<<<WARRANTIES>>>",     "<<<END_WARRANTIES>>>")
-    special_terms = g("<<<SPECIAL_TERMS>>>",  "<<<END_SPECIAL_TERMS>>>")
-    general_terms = g("<<<GENERAL_TERMS>>>",  "<<<END_GENERAL_TERMS>>>")
-
-    return {
-        "الفريق_الأول":   g("<<<TEAM_A>>>", "<<<END_TEAM_A>>>"),
-        "الفريق_الثاني":  g("<<<TEAM_B>>>", "<<<END_TEAM_B>>>"),
-        "تاريخ_البدء":    g("<<<DATE_START>>>", "<<<END_DATE_START>>>"),
-        "تاريخ_الانتهاء": g("<<<DATE_END>>>",   "<<<END_DATE_END>>>"),
-        "ملخص_الاتفاقية": summary_txt,             # النص الأصلي (احتياط)
-        "ملخص_الاتفاقية_نقاط": to_points(summary_txt),
-        "المواد": items,
-        "فقرة_الكفالات": warranties,               # النص الأصلي (احتياط)
-        "فقرة_الكفالات_نقاط": to_points(warranties),
-        "الشروط_الخاصة": special_terms,            # النص الأصلي (احتياط)
-        "الشروط_الخاصة_نقاط": to_points(special_terms),
-        "الشروط_العامة": general_terms,            # النص الأصلي (احتياط)
-        "الشروط_العامة_نقاط": to_points(general_terms),
-    }
-
-
+    return {"المواد": items}
 
 # ===========================
 # 4.1) أدوات التجزئة والدمج + قائمة الموديلات الاحتياطية
@@ -569,61 +486,14 @@ else:
 
 debug = st.toggle("🧠 إظهار مخرجات التشخيص (Raw)")
 
-if "ocr_text" in st.session_state and selected_model and st.button("تحليل الاتفاقية"):
+if "ocr_text" in st.session_state and selected_model and st.button("تحليل (مواد فقط)"):
     try:
         result = analyze_agreement_with_gemini(st.session_state["ocr_text"], selected_model, debug)
-        st.success("✅ تم التحليل بنجاح")
-
-        # عرض الأقسام بشكل أنيق
-        with st.container():
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown('<div class="card"><div class="section-title">👥 الفريق الأول</div>', unsafe_allow_html=True)
-                st.write(result.get("الفريق_الأول") or "—")
-                st.markdown('</div>', unsafe_allow_html=True)
-
-            with c2:
-                st.markdown('<div class="card"><div class="section-title">👥 الفريق الثاني</div>', unsafe_allow_html=True)
-                st.write(result.get("الفريق_الثاني") or "—")
-                st.markdown('</div>', unsafe_allow_html=True)
-
-        with st.container():
-            c3, c4 = st.columns(2)
-            with c3:
-                st.markdown('<div class="card"><div class="section-title">📅 تاريخ البدء</div>', unsafe_allow_html=True)
-                st.write(result.get("تاريخ_البدء") or "—")
-                st.markdown('</div>', unsafe_allow_html=True)
-            with c4:
-                st.markdown('<div class="card"><div class="section-title">📅 تاريخ الانتهاء</div>', unsafe_allow_html=True)
-                st.write(result.get("تاريخ_الانتهاء") or "—")
-                st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="card"><div class="section-title">📝 ملخص الاتفاقية</div>', unsafe_allow_html=True)
-        st.write(result.get("ملخص_الاتفاقية") or "—")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # جدول المواد
-        render_items_table(result.get("المواد", []) or [])
-
-        # باقي الأقسام النصية
-        with st.container():
-            st.markdown('<div class="card"><div class="section-title">🛡️ فقرة الكفالات</div>', unsafe_allow_html=True)
-            st.write(result.get("فقرة_الكفالات") or "—")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        with st.container():
-            st.markdown('<div class="card"><div class="section-title">⚙️ الشروط الخاصة</div>', unsafe_allow_html=True)
-            st.write(result.get("الشروط_الخاصة") or "—")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        with st.container():
-            st.markdown('<div class="card"><div class="section-title">📜 الشروط العامة</div>', unsafe_allow_html=True)
-            st.write(result.get("الشروط_العامة") or "—")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        # عرض JSON الخام (للتنزيل/المراجعة)
-        with st.expander("🔎 JSON الكامل للنتيجة"):
-            st.json(result)
-
+        st.success("✅ تم استخراج المواد")
+        # عرض المواد فقط
+        render_items_table(result.get("المواد", []) or [], title="📦 المواد المستخرجة")
+        # خيار: إظهار JSON للمواد فقط
+        with st.expander("🔎 JSON المواد"):
+            st.json(result.get("المواد", []))
     except Exception as e:
         st.error(f"❌ فشل التحليل: {e}")
