@@ -1,7 +1,9 @@
 import streamlit as st
 import google.generativeai as genai
-import json, re, os
+import json, re, os, io, base64, tempfile
 from google.cloud import vision
+from PIL import Image
+import pdfplumber
 
 # ===========================
 # 1️⃣ إعداد المفاتيح
@@ -13,7 +15,6 @@ if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
 if VISION_KEY_B64:
-    import base64, tempfile
     key_json = base64.b64decode(VISION_KEY_B64).decode("utf-8")
     with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
         tmp.write(key_json.encode("utf-8"))
@@ -21,15 +22,46 @@ if VISION_KEY_B64:
 
 
 # ===========================
-# 2️⃣ OCR Google Vision
+# 2️⃣ OCR شامل (صور + PDF)
 # ===========================
-def extract_text_with_google_vision(image_file):
-    client = vision.ImageAnnotatorClient()
-    content = image_file.read()
-    image = vision.Image(content=content)
-    response = client.text_detection(image=image)
-    texts = response.text_annotations
-    return texts[0].description if texts else ""
+def _vision_client():
+    return vision.ImageAnnotatorClient()
+
+def _ocr_image_bytes(client: vision.ImageAnnotatorClient, img_bytes: bytes) -> str:
+    image = vision.Image(content=img_bytes)
+    resp = client.document_text_detection(image=image)
+    if resp.error.message:
+        raise RuntimeError(resp.error.message)
+    if resp.full_text_annotation and resp.full_text_annotation.text:
+        return resp.full_text_annotation.text
+    if resp.text_annotations:
+        return resp.text_annotations[0].description
+    return ""
+
+def extract_text_any(uploaded_file, dpi: int = 200) -> str:
+    """
+    يدعم PDF + صور (PNG/JPG). للـ PDF نُحوّل كل صفحة إلى صورة ثم نطبّق OCR.
+    """
+    name = (uploaded_file.name or "").lower()
+    uploaded_file.seek(0)
+    data = uploaded_file.read()
+
+    client = _vision_client()
+
+    if name.endswith(".pdf"):
+        pages_text = []
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for page in pdf.pages:
+                pil = page.to_image(resolution=dpi).original.convert("RGB")
+                buf = io.BytesIO()
+                pil.save(buf, format="PNG")
+                pages_text.append(_ocr_image_bytes(client, buf.getvalue()))
+        return ("\n\n--- صفحة جديدة ---\n\n".join(t.strip() for t in pages_text)).strip()
+    else:
+        pil = Image.open(io.BytesIO(data)).convert("RGB")
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        return _ocr_image_bytes(client, buf.getvalue())
 
 
 # ===========================
@@ -101,7 +133,6 @@ def _between(s: str, start_tag: str, end_tag: str) -> str:
     m = pat.search(s)
     return (m.group(1).strip() if m else "")
 
-
 def parse_tagged_response(raw: str) -> dict:
     raw = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u200B\u200C\u200D]", "", raw).strip()
 
@@ -129,7 +160,7 @@ def parse_tagged_response(raw: str) -> dict:
 
 
 # ===========================
-# 5️⃣ التحليل باستخدام Gemini
+# 5️⃣ تحليل بالـ Gemini
 # ===========================
 def analyze_agreement_with_gemini(text: str, selected_model: str, debug: bool = False) -> dict:
     prompt = AGREEMENT_PROMPT_TEMPLATE.format(doc_text=text)
@@ -148,7 +179,6 @@ def analyze_agreement_with_gemini(text: str, selected_model: str, debug: bool = 
         tried.append(selected_model.replace("2.5", "1.5"))
     tried += ["models/gemini-1.5-pro", "models/gemini-1.5-flash"]
 
-    errors = []
     for m in tried:
         try:
             raw = run_once(m)
@@ -157,44 +187,32 @@ def analyze_agreement_with_gemini(text: str, selected_model: str, debug: bool = 
                 st.code(raw[:1200] + ("..." if len(raw) > 1200 else ""))
             return parse_tagged_response(raw)
         except Exception as e:
-            errors.append(f"{m}: {e}")
-
-    raise RuntimeError("\n".join(errors))
-
-
-# ===========================
-# 6️⃣ Fallback بسيط لملء البيانات
-# ===========================
-def fallback_fill_from_text(result: dict, ocr_text: str) -> dict:
-    if not result.get("الفريق_الأول"):
-        m = re.search(r"الفريق\s*الأول\s*[:：]\s*(.+)", ocr_text)
-        if m: result["الفريق_الأول"] = m.group(1).strip()
-    if not result.get("الفريق_الثاني"):
-        m = re.search(r"الفريق\s*الثاني\s*[:：]\s*(.+)", ocr_text)
-        if m: result["الفريق_الثاني"] = m.group(1).strip()
-    return result
+            continue
+    raise RuntimeError("❌ فشل التحليل عبر جميع الموديلات")
 
 
 # ===========================
-# 7️⃣ واجهة Streamlit
+# 6️⃣ واجهة Streamlit
 # ===========================
 st.set_page_config(page_title="تحليل اتفاقيات المؤسسة الاستهلاكية العسكرية", layout="wide")
-
 st.title("📑 نظام تحليل اتفاقيات المؤسسة الاستهلاكية العسكرية")
 st.markdown("باستخدام **Google Vision OCR + Gemini AI**")
 
-# ✅ خطوة 1: رفع الصورة
-uploaded = st.file_uploader("📤 ارفع صورة الاتفاقية", type=["png", "jpg", "jpeg", "pdf"])
+uploaded = st.file_uploader("📤 ارفع صورة أو ملف PDF", type=["png", "jpg", "jpeg", "pdf"])
 
-if uploaded:
-    if st.button("📄 استخراج النص"):
-        with st.spinner("جارٍ تحليل الصورة..."):
-            text = extract_text_with_google_vision(uploaded)
-            st.session_state["ocr_text"] = text
-        st.success("✅ تم استخراج النص بنجاح!")
-        st.text_area("النص المستخرج:", text, height=250)
+if uploaded and st.button("📄 استخراج النص"):
+    try:
+        with st.spinner("جارٍ استخراج النص عبر Google Vision..."):
+            text = extract_text_any(uploaded)
+        st.session_state["ocr_text"] = text
+        st.success("✅ تم استخراج النص!")
+    except Exception as e:
+        st.error(f"❌ فشل استخراج النص: {e}")
 
-# ✅ خطوة 2: إعداد Gemini
+# عرض النص
+st.text_area("📝 النص المستخرج:", st.session_state.get("ocr_text", ""), height=300)
+
+# إعداد Gemini
 if GEMINI_KEY:
     st.success("✅ مفتاح Gemini صالح.")
     models_list = genai.list_models()
@@ -203,13 +221,11 @@ if GEMINI_KEY:
 else:
     st.error("❌ لم يتم العثور على مفتاح Gemini")
 
-# ✅ خطوة 3: تحليل النص
 debug = st.toggle("🧠 إظهار مخرجات التشخيص (Raw)")
 
 if "ocr_text" in st.session_state and st.button("تحليل الاتفاقية"):
     try:
         result = analyze_agreement_with_gemini(st.session_state["ocr_text"], selected_model, debug)
-        result = fallback_fill_from_text(result, st.session_state["ocr_text"])
         st.success("✅ تم التحليل بنجاح")
         st.json(result)
     except Exception as e:
