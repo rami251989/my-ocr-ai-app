@@ -44,56 +44,60 @@ st.markdown("""
 # =========================
 def safe_json_loads(text: str):
     """
-    يحوّل استجابة النموذج إلى JSON حتى لو:
-    - ملفوفة بـ ```json ... ```
-    - بدأت بسطر مفتاح بدون { } → نلفّها تلقائيًا
-    - فيها اقتباسات ذكية “ ” أو ’
-    - بصيغة dict بايثون (single quotes) → نجرب ast.literal_eval
-    - فيها فواصل زائدة قبل } أو ]
+    JSON sanitizer قوي:
+    - يزيل محارف الاتجاه: LRM/RLM/LRE/RLE/PDF/LRI/RLI/FSI/PDI
+    - يزيل BOM و zero-width
+    - يطبّع الاقتباسات الذكية إلى عادية
+    - يلفّ مفاتيح تبدأ من أول سطر بدون { } بأقواس
+    - يزيل الفواصل الزائدة قبل } أو ]
+    - يحاول ast.literal_eval كحل أخير
     """
     import re, json, ast
 
     if not text:
         raise ValueError("نص فارغ من النموذج")
 
-    s = text.strip()
+    s = text
 
-    # أزل code fences
-    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s,
-               flags=re.IGNORECASE | re.MULTILINE).strip()
+    # 1) أزل code fences ```json ... ```
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.IGNORECASE | re.MULTILINE)
 
-    # طبع الاقتباسات الذكية إلى عادية
+    # 2) أزل محارف الاتجاه + BOM + zero-width
+    bidi_ctrl = r"[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u200B\u200C\u200D]"
+    s = re.sub(bidi_ctrl, "", s)
+
+    # 3) طبّع الاقتباسات الذكية
     s = s.replace("“", '"').replace("”", '"').replace("„", '"').replace("«", '"').replace("»", '"')
     s = s.replace("’", "'").replace("‘", "'")
 
-    # لو أول non-space هو quote (بدون {) لفّ النص بأقواس
-    ls = s.lstrip("\ufeff \t\r\n")
-    if ls and ls[0] in ['"', "'"] and not ls.startswith("{"):
+    s = s.strip()
+
+    # 4) لو بدأ النص بمفتاح بين "" بدون { } لفّه
+    if s and not s.startswith("{") and s.lstrip().startswith('"'):
         s = "{\n" + s
         if not s.rstrip().endswith("}"):
             s = s.rstrip().rstrip(",") + "\n}"
 
-    # 1) محاولة JSON مباشر
+    # 5) إزالة الفواصل الزائدة قبل } أو ]
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+
+    # 6) محاولة JSON مباشرة
     try:
         return json.loads(s)
     except Exception:
         pass
 
-    # 2) اقتنص أول كائن { .. } متوازن
+    # 7) اقتنص أول كائن { ... } متوازن
     start, end = s.find("{"), s.rfind("}")
     if start != -1 and end != -1 and end > start:
         candidate = s[start:end+1]
+        candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
         try:
             return json.loads(candidate)
         except Exception:
-            # إزالة فواصل زائدة قبل الأقواس
-            candidate2 = re.sub(r",\s*([}\]])", r"\1", candidate)
-            try:
-                return json.loads(candidate2)
-            except Exception:
-                pass
+            pass
 
-    # 3) Python-like dict (single quotes) → ast.literal_eval
+    # 8) كحل أخير: dict بصيغة بايثون (single quotes)
     try:
         obj = ast.literal_eval(s)
         if isinstance(obj, dict):
@@ -103,7 +107,8 @@ def safe_json_loads(text: str):
     except Exception:
         pass
 
-    raise ValueError(f"تعذّر تحويل استجابة النموذج إلى JSON. جزء من النص: {s[:250]}")
+    raise ValueError(f"تعذّر تحويل استجابة النموذج إلى JSON. جزء من النص:\n{s[:300]}")
+
 
 
 # =========================
